@@ -14,10 +14,9 @@ API_HASH = "5e270d2e3ed53eb5d37c8f8016ff4bcd"
 
 app = Client("cookiebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Store pending domain requests: {user_id: asyncio.Future}
 pending_domains = {}
 
-# ── Cookie filename matching (from your CLI tool) ─────────────────────────────
+# ── Cookie filename matching ──────────────────────────────────────────────────
 COOKIE_FILENAMES_EXACT = {
     "cookies.txt", "cookies", "cookie.txt", "cookie",
     "network cookies", "network_cookies", "network cookies.txt",
@@ -42,7 +41,32 @@ def is_cookie_file(fname: str) -> bool:
             return True
     return False
 
-# ── Netscape cookie parser ────────────────────────────────────────────────────
+# ── Validate a single cookie line is proper netscape format ──────────────────
+def is_valid_netscape_line(parts: list) -> bool:
+    if len(parts) < 7:
+        return False
+    domain, flag, path, secure, expiry, name, value = parts[:7]
+    # domain must start with . or be a hostname
+    if not domain or not ('.' in domain):
+        return False
+    # flag must be TRUE or FALSE
+    if flag.upper() not in ('TRUE', 'FALSE'):
+        return False
+    # path must start with /
+    if not path.startswith('/'):
+        return False
+    # secure must be TRUE or FALSE
+    if secure.upper() not in ('TRUE', 'FALSE'):
+        return False
+    # expiry must be a number
+    if not expiry.isdigit():
+        return False
+    # name must be printable ascii, no spaces
+    if not name or ' ' in name or not name.isprintable():
+        return False
+    return True
+
+# ── Netscape cookie parser with validation ───────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     domain_filter = domain_filter.strip().lower().lstrip(".")
     results = []
@@ -53,20 +77,16 @@ def parse_netscape_cookies(text: str, domain_filter: str):
         parts = line.split("\t")
         if len(parts) < 7:
             parts = re.split(r"\s+", line, maxsplit=6)
-        if len(parts) < 7:
-            continue
+        if not is_valid_netscape_line(parts):
+            continue  # ← skip garbage/binary lines
         domain, flag, path, secure, expiry, name, value = parts[:7]
         domain_clean = domain.lower().lstrip(".")
         if domain_filter in domain_clean or domain_clean in domain_filter:
             results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
     return results
 
-# ── Recursive ZIP extraction into memory ─────────────────────────────────────
+# ── Recursive ZIP collector ───────────────────────────────────────────────────
 def collect_cookie_files_from_zip(zip_path: str, depth: int = 0, max_depth: int = 6):
-    """
-    Recursively opens ZIPs (including nested ZIPs) and returns list of
-    (filename, content_bytes) for all cookie files found.
-    """
     results = []
     if depth > max_depth:
         return results
@@ -79,7 +99,6 @@ def collect_cookie_files_from_zip(zip_path: str, depth: int = 0, max_depth: int 
                 basename = os.path.basename(fname)
 
                 if basename.lower().endswith('.zip'):
-                    # Nested ZIP — extract to temp and recurse
                     try:
                         data = zf.read(member)
                         nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
@@ -120,7 +139,8 @@ async def start_handler(client: Client, message: Message):
         "🔹 Bot asks for domain\n"
         "🔹 Type `netflix.com`\n"
         "🔹 Receive ZIP → `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
-        "✅ Supports nested ZIPs!",
+        "✅ Only valid Netscape cookies saved\n"
+        "✅ Nested ZIPs supported",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
@@ -148,16 +168,48 @@ async def process_zip(client: Client, message: Message):
     zip_path = f"/tmp/{uid}_{int(time.time())}.zip"
     status = await message.reply("⬇️ **Downloading...**")
 
-    last_pct = [0]
+    # ── Progress bar with speed + ETA ────────────────────────────────────────
+    last_update_time = [time.time()]
+    last_update_bytes = [0]
+
     async def progress(current, total):
-        pct = current / filesize * 100
-        if pct - last_pct[0] < 10: return
-        last_pct[0] = pct
-        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+        now = time.time()
+        elapsed_since_last = now - last_update_time[0]
+        if elapsed_since_last < 2.0:
+            return
+
+        bytes_since_last = current - last_update_bytes[0]
+        speed_bps = bytes_since_last / elapsed_since_last if elapsed_since_last > 0 else 0
+        remaining = total - current
+        eta = int(remaining / speed_bps) if speed_bps > 0 else 0
+
+        last_update_time[0] = now
+        last_update_bytes[0] = current
+
+        pct = current / total * 100
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+
+        # Human-readable speed
+        if speed_bps >= 1_000_000:
+            speed_str = f"{speed_bps/1_000_000:.1f} MB/s"
+        elif speed_bps >= 1_000:
+            speed_str = f"{speed_bps/1_000:.0f} KB/s"
+        else:
+            speed_str = f"{speed_bps:.0f} B/s"
+
+        # Human-readable ETA
+        if eta >= 60:
+            eta_str = f"{eta//60}m {eta%60}s"
+        else:
+            eta_str = f"{eta}s"
+
         try:
             await status.edit_text(
-                f"⬇️ **{fname}**\n[{bar}] **{pct:.1f}%**\n"
-                f"{current/1e6:.1f}/{filesize/1e6:.1f} MB",
+                f"⬇️ **Downloading** `{fname}`\n"
+                f"`[{bar}]` **{pct:.1f}%**\n"
+                f"📦 {current/1e6:.1f} / {total/1e6:.1f} MB\n"
+                f"⚡ **{speed_str}** | ⏱️ ETA: **{eta_str}**",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
         except: pass
@@ -171,8 +223,15 @@ async def process_zip(client: Client, message: Message):
         return
 
     elapsed = time.time() - start_time
+    avg_speed = filesize / elapsed if elapsed > 0 else 0
+    if avg_speed >= 1_000_000:
+        avg_str = f"{avg_speed/1_000_000:.1f} MB/s"
+    else:
+        avg_str = f"{avg_speed/1_000:.0f} KB/s"
+
     await status.edit_text(
-        f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s\n\n"
+        f"✅ **Downloaded** `{fname}`\n"
+        f"⚡ {elapsed:.1f}s @ {avg_str}\n\n"
         f"📝 **Send the domain name now:**\n"
         f"Example: `netflix.com` or `instagram.com`",
         parse_mode=enums.ParseMode.MARKDOWN
@@ -194,8 +253,7 @@ async def process_zip(client: Client, message: Message):
 
     await status.edit_text(f"🔍 **Scanning for `{domain}` cookies...**")
 
-    # ── Scan using CLI tool logic ─────────────────────────────────────────────
-    domain_prefix = domain.upper().split(".")[0]   # e.g. "NETFLIX"
+    domain_prefix = domain.upper().split(".")[0]
     output_zip_path = f"/tmp/{uid}_{domain}_results.zip"
     total_matches = 0
     counter = 1
@@ -206,7 +264,6 @@ async def process_zip(client: Client, message: Message):
         scanned = len(cookie_files)
         print(f"📁 Found {scanned} cookie files")
 
-        # Delete input ZIP right after collecting
         if os.path.exists(zip_path):
             os.remove(zip_path)
             print("🧹 Input ZIP deleted")
@@ -227,8 +284,8 @@ async def process_zip(client: Client, message: Message):
 
         if total_matches > 0:
             await status.edit_text(
-                f"🎉 **{total_matches} cookies** found for `{domain}`\n"
-                f"📁 {scanned} files scanned\n"
+                f"🎉 **{total_matches} valid cookies** for `{domain}`\n"
+                f"📁 {scanned} files scanned | 📄 {counter-1} output files\n"
                 f"📦 Sending ZIP...",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -237,14 +294,15 @@ async def process_zip(client: Client, message: Message):
                 document=output_zip_path,
                 caption=(
                     f"🍪 **{total_matches} cookies** for `{domain}`\n"
-                    f"📄 Files: `{domain_prefix}_1.txt` → `{domain_prefix}_{counter-1}.txt`"
+                    f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{counter-1}.txt`\n"
+                    f"✅ All garbage/binary lines filtered out"
                 ),
                 parse_mode=enums.ParseMode.MARKDOWN
             )
             await status.delete()
         else:
             await status.edit_text(
-                f"❌ **No cookies** found for `{domain}`\n"
+                f"❌ **No valid cookies** found for `{domain}`\n"
                 f"📁 {scanned} files scanned"
             )
 
