@@ -4,6 +4,8 @@ import time
 import asyncio
 import logging
 import zipfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
@@ -12,6 +14,9 @@ API_ID = 32201838
 API_HASH = "5e270d2e3ed53eb5d37c8f8016ff4bcd"
 
 app = Client("cookiebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Store pending domain requests: {user_id: asyncio.Future}
+pending_domains = {}
 
 COOKIE_FILENAMES = ["cookies.txt", "cookies", "cookie.txt", "cookie", "network", "chrome", "firefox", "edge", "brave"]
 
@@ -34,35 +39,32 @@ def parse_netscape_cookies(text: str, domain_filter: str):
             results.append('\t'.join([domain, flag, path, secure, expiry, name, value]))
     return results
 
-@app.on_message()
-async def main_handler(client: Client, message: Message):
+@app.on_message(filters.text & ~filters.command("start"))
+async def text_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else 0
-    
-    # Safe document check
-    doc_name = message.document.file_name if message.document and hasattr(message.document, 'file_name') else None
-    doc_size = message.document.file_size if message.document and hasattr(message.document, 'file_size') else 0
-    
-    print(f"📨 RAW: User={uid} | Text='{message.text[:30] if message.text else 'None'}' | Doc={doc_name} ({doc_size})")
-    
-    # /start command
-    if message.text and message.text.lower().startswith('/start'):
-        await message.reply(
-            "**🚀 Cookie Bot READY**\n\n"
-            "🔹 Forward ZIP file\n"
-            "🔹 Reply with `netflix.com`\n\n"
-            "**⚡ Optimized download + memory scan**",
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
-        print("✅ /start OK")
-        return
-    
-    # ZIP PROCESSING
-    if message.document and doc_name and 'zip' in doc_name.lower():
-        print(f"🎯 ZIP DETECTED: {doc_name}")
-        print("🚀 PROCESSING ZIP...")
+    # If user is waiting for domain, resolve it
+    if uid in pending_domains:
+        future = pending_domains.pop(uid)
+        if not future.done():
+            future.get_loop().call_soon_threadsafe(future.set_result, message.text.strip().lower())
+
+@app.on_message(filters.command("start"))
+async def start_handler(client: Client, message: Message):
+    await message.reply(
+        "**🚀 Cookie Bot READY**\n\n"
+        "🔹 Send a ZIP file\n"
+        "🔹 Bot will ask for domain\n"
+        "🔹 Reply with `netflix.com`\n\n"
+        "**⚡ Optimized download + memory scan**",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
+@app.on_message(filters.document)
+async def doc_handler(client: Client, message: Message):
+    doc_name = message.document.file_name if message.document else None
+    if doc_name and 'zip' in doc_name.lower():
         await process_zip(client, message)
-        return
-    elif message.document:
+    else:
         await message.reply("❌ **ZIP file only** please!", parse_mode=enums.ParseMode.MARKDOWN)
 
 async def process_zip(client: Client, message: Message):
@@ -70,97 +72,72 @@ async def process_zip(client: Client, message: Message):
     fname = doc.file_name or "upload.zip"
     filesize = doc.file_size or 0
     uid = message.from_user.id
-    
+
     print(f"📥 ZIP: {fname} ({filesize/1e6:.1f}MB)")
-    
+
     if filesize > 2e9:
         await message.reply("❌ Max 2GB")
         return
-    
+
     start_time = time.time()
     zip_path = f"/tmp/{uid}_{int(time.time())}.zip"
     status = await message.reply("⬇️ **Downloading...**")
-    
-    last_update = [0]
+
+    last_pct = [0]
     async def progress(current, total):
-        nonlocal status
         now = time.time()
-        elapsed = now - last_update[0]
-        if elapsed < 2.0: return
-        
-        speed = (current - last_update[0]) / elapsed if elapsed > 0 else 0
-        eta = (total - current) / speed if speed > 0 else 0
-        last_update[0] = now
-        
         pct = current / filesize * 100
+        if pct - last_pct[0] < 10: return
+        last_pct[0] = pct
         bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
-        
         try:
             await status.edit_text(
                 f"⬇️ **{fname}**\n[{bar}] **{pct:.1f}%**\n"
-                f"{current/1e6:.1f}/{filesize/1e6:.1f} MB\n"
-                f"⚡ **{speed/1024:.1f} KB/s** ⏱️ ETA: {int(eta)}s",
+                f"{current/1e6:.1f}/{filesize/1e6:.1f} MB",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
-        except Exception as e:
-            print(f"⚠️ Progress error: {e}")
-    
-    # 🔥 FIXED: No 'workers' parameter
+        except: pass
+
     try:
         await client.download_media(message, file_name=zip_path, progress=progress)
         print("✅ DOWNLOAD COMPLETE")
     except Exception as e:
-        print(f"❌ DOWNLOAD FAILED: {e}")
         await status.edit_text(f"❌ **Download failed**: {e}")
         if os.path.exists(zip_path): os.remove(zip_path)
         return
-    
+
     elapsed = time.time() - start_time
     avg_speed = filesize / elapsed / 1024 if elapsed > 0 else 0
-    print(f"⏱️ Download: {elapsed:.1f}s ({avg_speed:.1f} KB/s avg)")
-    
+
+    # Ask for domain - PROPER WAY using Future
     await status.edit_text(
-        f"✅ **Downloaded** `{fname}`\n"
-        f"⚡ **{elapsed:.1f}s** ({avg_speed:.1f} KB/s)\n\n"
-        f"🔍 **Reply to this message** with domain:\n"
-        f"`netflix.com` `instagram.com` etc."
+        f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s\n\n"
+        f"📝 **Send the domain name now:**\n"
+        f"Example: `netflix.com` or `instagram.com`",
+        parse_mode=enums.ParseMode.MARKDOWN
     )
-    
-    # WAIT FOR DOMAIN (reply to THIS message)
-    domain = ""
-    max_wait = 30  # 30 seconds
-    wait_start = time.time()
-    
-    while time.time() - wait_start < max_wait:
-        try:
-            async for msg in client.get_chat_history(message.chat.id, limit=10):
-                if (msg.reply_to_message and msg.reply_to_message.id == message.id and 
-                    msg.text and msg.from_user.id == uid and not msg.text.startswith('/')):
-                    domain = msg.text.strip().lower()
-                    print(f"🌐 DOMAIN: {domain}")
-                    break
-            if domain: break
-            await asyncio.sleep(2)
-        except:
-            await asyncio.sleep(2)
-    
-    if not domain:
-        await status.edit_text(
-            "⏰ **No domain received in 30s**\n\n"
-            "**Reply to download message** with domain\n"
-            "or send `/start` to restart"
-        )
+
+    # Wait for domain using asyncio Future (no polling!)
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    pending_domains[uid] = future
+
+    try:
+        domain = await asyncio.wait_for(future, timeout=60)
+        print(f"🌐 DOMAIN: {domain}")
+    except asyncio.TimeoutError:
+        pending_domains.pop(uid, None)
+        await status.edit_text("⏰ **Timed out.** Send the ZIP again and reply with domain within 60s.")
         if os.path.exists(zip_path): os.remove(zip_path)
         return
-    
-    # MEMORY SCAN - NO EXTRACTION NEEDED!
-    await status.edit_text(f"🔍 **Scanning `{domain}` cookies...**")
-    print("🔍 MEMORY SCAN START")
-    
+
+    # MEMORY SCAN
+    await status.edit_text(f"🔍 **Scanning for `{domain}` cookies...**")
+
     total_matches = 0
     results = []
     scanned = 0
-    
+
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for member in zf.infolist():
@@ -177,11 +154,10 @@ async def process_zip(client: Client, message: Message):
                                 print(f"✅ {len(matches)} cookies found!")
                     except Exception as e:
                         print(f"⚠️ Skip {member.filename}: {e}")
-        
+
         if os.path.exists(zip_path):
             os.remove(zip_path)
-            print("🧹 Cleanup OK")
-        
+
         if total_matches > 0:
             output = f"🎉 **{total_matches} COOKIES** for `{domain}`\n"
             output += f"📊 **{scanned} files** scanned:\n\n"
@@ -189,21 +165,29 @@ async def process_zip(client: Client, message: Message):
             if len(results) > 3:
                 output += f"\n\n... **+{len(results)-3} more files**"
             await status.edit_text(output, parse_mode=enums.ParseMode.MARKDOWN)
-            print(f"🎉 SUCCESS: {total_matches} cookies")
         else:
             await status.edit_text(
                 f"❌ **No cookies** for `{domain}`\n"
                 f"📁 **{scanned} files** scanned"
             )
-            print("❌ No cookies found")
-            
+
     except Exception as e:
         print(f"❌ PROCESS ERROR: {e}")
         await status.edit_text(f"❌ **Error**: {e}")
         if os.path.exists(zip_path): os.remove(zip_path)
 
+# Fake web server for Render free tier (port binding)
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args): pass
+
+def run_server():
+    HTTPServer(("0.0.0.0", 10000), Handler).serve_forever()
+
 if __name__ == "__main__":
-    print("🚀 ULTRA Cookie Bot - DOWNLOAD FIXED!")
-    print("📨 Forward ZIP → Reply domain → INSTANT RESULTS!")
-    print("⚡ pip install tgcrypto for 10x faster downloads")
+    print("🚀 Cookie Bot Starting...")
+    threading.Thread(target=run_server, daemon=True).start()
+    print("✅ Web server on port 10000")
     app.run()
