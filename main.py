@@ -7,7 +7,7 @@ import zipfile
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
-BOT_TOKEN = "8663784484AAEDaOYGkT8cCnkBvVaCNEp4fjQL3pgDPlQ"
+BOT_TOKEN = "8663784484:AAEDaOYGkT8cCnkBvVaCNEp4fjQL3pgDPlQ"
 API_ID = 32201838
 API_HASH = "5e270d2e3ed53eb5d37c8f8016ff4bcd"
 
