@@ -15,6 +15,7 @@ API_HASH = "5e270d2e3ed53eb5d37c8f8016ff4bcd"
 app = Client("cookiebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 pending_domains = {}
+pending_passwords = {}
 
 # ── Cookie filename matching ──────────────────────────────────────────────────
 COOKIE_FILENAMES_EXACT = {
@@ -41,32 +42,37 @@ def is_cookie_file(fname: str) -> bool:
             return True
     return False
 
-# ── Validate a single cookie line is proper netscape format ──────────────────
+# ── Check if ZIP is password protected ───────────────────────────────────────
+def is_zip_encrypted(zip_path: str) -> bool:
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            for member in zf.infolist():
+                if member.flag_bits & 0x1:  # encryption flag
+                    return True
+        return False
+    except:
+        return False
+
+# ── Validate cookie line ──────────────────────────────────────────────────────
 def is_valid_netscape_line(parts: list) -> bool:
     if len(parts) < 7:
         return False
     domain, flag, path, secure, expiry, name, value = parts[:7]
-    # domain must start with . or be a hostname
-    if not domain or not ('.' in domain):
+    if not domain or '.' not in domain:
         return False
-    # flag must be TRUE or FALSE
     if flag.upper() not in ('TRUE', 'FALSE'):
         return False
-    # path must start with /
     if not path.startswith('/'):
         return False
-    # secure must be TRUE or FALSE
     if secure.upper() not in ('TRUE', 'FALSE'):
         return False
-    # expiry must be a number
     if not expiry.isdigit():
         return False
-    # name must be printable ascii, no spaces
     if not name or ' ' in name or not name.isprintable():
         return False
     return True
 
-# ── Netscape cookie parser with validation ───────────────────────────────────
+# ── Netscape cookie parser ────────────────────────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     domain_filter = domain_filter.strip().lower().lstrip(".")
     results = []
@@ -78,15 +84,15 @@ def parse_netscape_cookies(text: str, domain_filter: str):
         if len(parts) < 7:
             parts = re.split(r"\s+", line, maxsplit=6)
         if not is_valid_netscape_line(parts):
-            continue  # ← skip garbage/binary lines
+            continue
         domain, flag, path, secure, expiry, name, value = parts[:7]
         domain_clean = domain.lower().lstrip(".")
         if domain_filter in domain_clean or domain_clean in domain_filter:
             results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
     return results
 
-# ── Recursive ZIP collector ───────────────────────────────────────────────────
-def collect_cookie_files_from_zip(zip_path: str, depth: int = 0, max_depth: int = 6):
+# ── Recursive ZIP collector (with optional password) ─────────────────────────
+def collect_cookie_files_from_zip(zip_path: str, password: bytes = None, depth: int = 0, max_depth: int = 6):
     results = []
     if depth > max_depth:
         return results
@@ -100,11 +106,11 @@ def collect_cookie_files_from_zip(zip_path: str, depth: int = 0, max_depth: int 
 
                 if basename.lower().endswith('.zip'):
                     try:
-                        data = zf.read(member)
+                        data = zf.read(member, pwd=password)
                         nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
                         with open(nested_path, 'wb') as f:
                             f.write(data)
-                        nested = collect_cookie_files_from_zip(nested_path, depth + 1, max_depth)
+                        nested = collect_cookie_files_from_zip(nested_path, password, depth + 1, max_depth)
                         results.extend(nested)
                         os.remove(nested_path)
                     except Exception as e:
@@ -112,7 +118,7 @@ def collect_cookie_files_from_zip(zip_path: str, depth: int = 0, max_depth: int 
 
                 elif is_cookie_file(basename):
                     try:
-                        content = zf.read(member)
+                        content = zf.read(member, pwd=password)
                         results.append((fname, content))
                     except Exception as e:
                         print(f"⚠️ Read error {fname}: {e}")
@@ -122,10 +128,19 @@ def collect_cookie_files_from_zip(zip_path: str, depth: int = 0, max_depth: int 
         print(f"⚠️ ZIP open error: {e}")
     return results
 
-# ── Telegram handlers ─────────────────────────────────────────────────────────
+# ── Text handler (domain + password) ─────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else 0
+
+    # Check password first
+    if uid in pending_passwords:
+        future = pending_passwords.pop(uid)
+        if not future.done():
+            future.get_loop().call_soon_threadsafe(future.set_result, message.text.strip())
+        return
+
+    # Then domain
     if uid in pending_domains:
         future = pending_domains.pop(uid)
         if not future.done():
@@ -138,7 +153,8 @@ async def start_handler(client: Client, message: Message):
         "🔹 Send a ZIP file\n"
         "🔹 Bot asks for domain\n"
         "🔹 Type `netflix.com`\n"
-        "🔹 Receive ZIP → `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
+        "🔹 Receive `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
+        "🔐 Password-protected ZIPs supported\n"
         "✅ Only valid Netscape cookies saved\n"
         "✅ Nested ZIPs supported",
         parse_mode=enums.ParseMode.MARKDOWN
@@ -158,8 +174,6 @@ async def process_zip(client: Client, message: Message):
     filesize = doc.file_size or 0
     uid = message.from_user.id
 
-    print(f"📥 ZIP: {fname} ({filesize/1e6:.1f}MB)")
-
     if filesize > 2e9:
         await message.reply("❌ Max 2GB")
         return
@@ -177,33 +191,22 @@ async def process_zip(client: Client, message: Message):
         elapsed_since_last = now - last_update_time[0]
         if elapsed_since_last < 2.0:
             return
-
         bytes_since_last = current - last_update_bytes[0]
         speed_bps = bytes_since_last / elapsed_since_last if elapsed_since_last > 0 else 0
         remaining = total - current
         eta = int(remaining / speed_bps) if speed_bps > 0 else 0
-
         last_update_time[0] = now
         last_update_bytes[0] = current
-
         pct = current / total * 100
         filled = int(pct / 5)
         bar = "█" * filled + "░" * (20 - filled)
-
-        # Human-readable speed
         if speed_bps >= 1_000_000:
             speed_str = f"{speed_bps/1_000_000:.1f} MB/s"
         elif speed_bps >= 1_000:
             speed_str = f"{speed_bps/1_000:.0f} KB/s"
         else:
             speed_str = f"{speed_bps:.0f} B/s"
-
-        # Human-readable ETA
-        if eta >= 60:
-            eta_str = f"{eta//60}m {eta%60}s"
-        else:
-            eta_str = f"{eta}s"
-
+        eta_str = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
         try:
             await status.edit_text(
                 f"⬇️ **Downloading** `{fname}`\n"
@@ -216,7 +219,6 @@ async def process_zip(client: Client, message: Message):
 
     try:
         await client.download_media(message, file_name=zip_path, progress=progress)
-        print("✅ DOWNLOAD COMPLETE")
     except Exception as e:
         await status.edit_text(f"❌ **Download failed**: {e}")
         if os.path.exists(zip_path): os.remove(zip_path)
@@ -224,26 +226,65 @@ async def process_zip(client: Client, message: Message):
 
     elapsed = time.time() - start_time
     avg_speed = filesize / elapsed if elapsed > 0 else 0
-    if avg_speed >= 1_000_000:
-        avg_str = f"{avg_speed/1_000_000:.1f} MB/s"
+    avg_str = f"{avg_speed/1_000_000:.1f} MB/s" if avg_speed >= 1_000_000 else f"{avg_speed/1_000:.0f} KB/s"
+
+    # ── Check if ZIP is password protected ───────────────────────────────────
+    zip_password = None
+    if is_zip_encrypted(zip_path):
+        await status.edit_text(
+            f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s @ {avg_str}\n\n"
+            f"🔐 **ZIP is password protected!**\n"
+            f"Please send the password now:",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+
+        loop = asyncio.get_event_loop()
+        pwd_future = loop.create_future()
+        pending_passwords[uid] = pwd_future
+
+        try:
+            pwd_text = await asyncio.wait_for(pwd_future, timeout=60)
+            zip_password = pwd_text.encode('utf-8')
+            print(f"🔐 Password received")
+
+            # Test the password
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    first = next(m for m in zf.infolist() if not m.is_dir())
+                    zf.read(first, pwd=zip_password)
+            except RuntimeError:
+                await status.edit_text("❌ **Wrong password!** Send the ZIP again.")
+                if os.path.exists(zip_path): os.remove(zip_path)
+                return
+
+        except asyncio.TimeoutError:
+            pending_passwords.pop(uid, None)
+            await status.edit_text("⏰ **Timed out waiting for password.** Send ZIP again.")
+            if os.path.exists(zip_path): os.remove(zip_path)
+            return
     else:
-        avg_str = f"{avg_speed/1_000:.0f} KB/s"
+        await status.edit_text(
+            f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s @ {avg_str}\n\n"
+            f"📝 **Send the domain name now:**\n"
+            f"Example: `netflix.com` or `instagram.com`",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
 
-    await status.edit_text(
-        f"✅ **Downloaded** `{fname}`\n"
-        f"⚡ {elapsed:.1f}s @ {avg_str}\n\n"
-        f"📝 **Send the domain name now:**\n"
-        f"Example: `netflix.com` or `instagram.com`",
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
+    # ── Ask for domain ────────────────────────────────────────────────────────
+    if zip_password:
+        await status.edit_text(
+            f"✅ **Password correct!**\n\n"
+            f"📝 **Send the domain name now:**\n"
+            f"Example: `netflix.com` or `instagram.com`",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
 
-    # Wait for domain
     loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    pending_domains[uid] = future
+    domain_future = loop.create_future()
+    pending_domains[uid] = domain_future
 
     try:
-        domain = await asyncio.wait_for(future, timeout=60)
+        domain = await asyncio.wait_for(domain_future, timeout=60)
         print(f"🌐 DOMAIN: {domain}")
     except asyncio.TimeoutError:
         pending_domains.pop(uid, None)
@@ -260,7 +301,7 @@ async def process_zip(client: Client, message: Message):
     scanned = 0
 
     try:
-        cookie_files = collect_cookie_files_from_zip(zip_path)
+        cookie_files = collect_cookie_files_from_zip(zip_path, password=zip_password)
         scanned = len(cookie_files)
         print(f"📁 Found {scanned} cookie files")
 
