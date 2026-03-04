@@ -78,6 +78,27 @@ def is_encrypted(path: str) -> bool:
         return is_rar_encrypted(path)
     return is_zip_encrypted(path)
 
+# ── FIXED domain matching (no more substring bugs!) ──────────────────────────
+def domain_matches(cookie_domain: str, search_domain: str) -> bool:
+    """
+    Properly match cookie domain against user's search domain.
+    e.g. search 'netflix.com' should match '.netflix.com' and 'netflix.com'
+    but NOT 'x.com' even though 'x.com' is a substring of 'netflix.com'
+    """
+    cookie_domain = cookie_domain.lower().lstrip(".")
+    search_domain = search_domain.lower().lstrip(".")
+
+    # Exact match
+    if cookie_domain == search_domain:
+        return True
+    # Cookie domain is a subdomain of search domain: e.g. jobs.netflix.com matches netflix.com
+    if cookie_domain.endswith("." + search_domain):
+        return True
+    # Search domain is a subdomain of cookie domain: e.g. search 'jobs.netflix.com', cookie '.netflix.com'
+    if search_domain.endswith("." + cookie_domain):
+        return True
+    return False
+
 # ── Validate cookie line ──────────────────────────────────────────────────────
 def is_valid_netscape_line(parts: list) -> bool:
     if len(parts) < 7:
@@ -99,7 +120,6 @@ def is_valid_netscape_line(parts: list) -> bool:
 
 # ── Netscape cookie parser ────────────────────────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
-    domain_filter = domain_filter.strip().lower().lstrip(".")
     results = []
     for line in text.splitlines():
         line = line.strip()
@@ -110,10 +130,9 @@ def parse_netscape_cookies(text: str, domain_filter: str):
             parts = re.split(r"\s+", line, maxsplit=6)
         if not is_valid_netscape_line(parts):
             continue
-        domain, flag, path, secure, expiry, name, value = parts[:7]
-        domain_clean = domain.lower().lstrip(".")
-        if domain_filter in domain_clean or domain_clean in domain_filter:
-            results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
+        domain = parts[0]
+        if domain_matches(domain, domain_filter):
+            results.append("\t".join(parts[:7]))
     return results
 
 # ── Recursive archive collector ───────────────────────────────────────────────
@@ -181,8 +200,6 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None, depth: in
                         results.append((fname, content))
                     except Exception as e:
                         print(f"⚠️ Read error {fname}: {e}")
-    except rarfile.BadRarFile:
-        print(f"⚠️ Bad RAR: {rar_path}")
     except Exception as e:
         print(f"⚠️ RAR open error: {e}")
     return results
@@ -194,7 +211,6 @@ def collect_from_archive(path: str, password: bytes = None, depth: int = 0, max_
     return collect_cookie_files_from_zip(path, password, depth, max_depth)
 
 def test_archive_password(path: str, password: bytes) -> bool:
-    """Test if a password is correct for an archive."""
     try:
         if path.lower().endswith('.rar'):
             with rarfile.RarFile(path, 'r') as rf:
@@ -203,24 +219,24 @@ def test_archive_password(path: str, password: bytes) -> bool:
                 try:
                     rf.read(first)
                 except rarfile.BadRarFile:
-                    return False  # definitely wrong password
+                    return False
                 except Exception:
-                    pass  # other errors (CRC etc) - password may still be correct
+                    pass
         else:
             with zipfile.ZipFile(path, 'r') as zf:
                 first = next(m for m in zf.infolist() if not m.is_dir())
                 try:
                     zf.read(first, pwd=password)
                 except RuntimeError as e:
-                    if 'password' in str(e).lower() or 'Bad password' in str(e):
+                    if 'password' in str(e).lower():
                         return False
                 except Exception:
                     pass
         return True
     except Exception:
-        return True  # if we cant even open it, assume password is fine and let it fail later
+        return True
 
-# ── Text handler (password + domain) ─────────────────────────────────────────
+# ── Text handler ──────────────────────────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else 0
@@ -266,9 +282,8 @@ async def process_archive(client: Client, message: Message):
     is_rar = fname.lower().endswith('.rar')
 
     if is_rar and not RAR_SUPPORTED:
-        await message.reply("❌ **RAR not supported** on this server. Send a ZIP instead.")
+        await message.reply("❌ **RAR not supported** on this server.")
         return
-
     if filesize > 2e9:
         await message.reply("❌ Max 2GB")
         return
@@ -278,7 +293,7 @@ async def process_archive(client: Client, message: Message):
     archive_path = f"/tmp/{uid}_{int(time.time())}{ext}"
     status = await message.reply("⬇️ **Downloading...**")
 
-    # ── Progress bar ──────────────────────────────────────────────────────────
+    # ── Download progress bar ─────────────────────────────────────────────────
     last_update_time = [time.time()]
     last_update_bytes = [0]
 
@@ -296,12 +311,7 @@ async def process_archive(client: Client, message: Message):
         pct = current / total * 100
         filled = int(pct / 5)
         bar = "█" * filled + "░" * (20 - filled)
-        if speed_bps >= 1_000_000:
-            speed_str = f"{speed_bps/1_000_000:.1f} MB/s"
-        elif speed_bps >= 1_000:
-            speed_str = f"{speed_bps/1_000:.0f} KB/s"
-        else:
-            speed_str = f"{speed_bps:.0f} B/s"
+        speed_str = f"{speed_bps/1_000_000:.1f} MB/s" if speed_bps >= 1_000_000 else f"{speed_bps/1_000:.0f} KB/s"
         eta_str = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
         try:
             await status.edit_text(
@@ -324,7 +334,7 @@ async def process_archive(client: Client, message: Message):
     avg_speed = filesize / elapsed if elapsed > 0 else 0
     avg_str = f"{avg_speed/1_000_000:.1f} MB/s" if avg_speed >= 1_000_000 else f"{avg_speed/1_000:.0f} KB/s"
 
-    # ── Check password ────────────────────────────────────────────────────────
+    # ── Password check ────────────────────────────────────────────────────────
     archive_password = None
     if is_encrypted(archive_path):
         await status.edit_text(
@@ -339,15 +349,13 @@ async def process_archive(client: Client, message: Message):
         try:
             pwd_text = await asyncio.wait_for(pwd_future, timeout=60)
             archive_password = pwd_text.encode('utf-8')
-
             if not test_archive_password(archive_path, archive_password):
                 await status.edit_text("❌ **Wrong password!** Send the archive again.")
                 if os.path.exists(archive_path): os.remove(archive_path)
                 return
-
         except asyncio.TimeoutError:
             pending_passwords.pop(uid, None)
-            await status.edit_text("⏰ **Timed out waiting for password.** Send archive again.")
+            await status.edit_text("⏰ **Timed out.** Send archive again.")
             if os.path.exists(archive_path): os.remove(archive_path)
             return
 
@@ -377,41 +385,67 @@ async def process_archive(client: Client, message: Message):
         if os.path.exists(archive_path): os.remove(archive_path)
         return
 
-    await status.edit_text(f"🔍 **Scanning for `{domain}` cookies...**")
+    # ── Collect files first (to get total count for progress) ────────────────
+    await status.edit_text(f"📂 **Indexing files...**", parse_mode=enums.ParseMode.MARKDOWN)
+    cookie_files = collect_from_archive(archive_path, archive_password)
+    total_files = len(cookie_files)
+    print(f"📁 Found {total_files} cookie files")
 
+    if os.path.exists(archive_path):
+        os.remove(archive_path)
+        print("🧹 Input archive deleted")
+
+    # ── Scan with live progress bar ───────────────────────────────────────────
     domain_prefix = domain.upper().split(".")[0]
     output_zip_path = f"/tmp/{uid}_{domain}_results.zip"
     total_matches = 0
     counter = 1
-    scanned = 0
+    scan_start = time.time()
+    last_scan_update = [0]
 
     try:
-        cookie_files = collect_from_archive(archive_path, archive_password)
-        scanned = len(cookie_files)
-        print(f"📁 Found {scanned} cookie files")
-
-        if os.path.exists(archive_path):
-            os.remove(archive_path)
-            print("🧹 Input archive deleted")
-
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf_out:
-            for (orig_path, content_bytes) in cookie_files:
+            for i, (orig_path, content_bytes) in enumerate(cookie_files):
                 try:
                     text = content_bytes.decode('utf-8', errors='ignore')
                     matches = parse_netscape_cookies(text, domain)
                     if matches:
                         out_name = f"{domain_prefix}_{counter}.txt"
                         zf_out.writestr(out_name, "\n".join(matches))
-                        print(f"✅ {len(matches)} cookies → {out_name}")
                         total_matches += len(matches)
                         counter += 1
                 except Exception as e:
                     print(f"⚠️ Parse error {orig_path}: {e}")
 
+                # Update progress every 2 seconds
+                now = time.time()
+                if now - last_scan_update[0] >= 2.0:
+                    last_scan_update[0] = now
+                    elapsed_scan = now - scan_start
+                    speed = (i + 1) / elapsed_scan if elapsed_scan > 0 else 0
+                    remaining_files = total_files - (i + 1)
+                    eta_s = int(remaining_files / speed) if speed > 0 else 0
+                    eta_str = f"{eta_s//60}m {eta_s%60}s" if eta_s >= 60 else f"{eta_s}s"
+                    pct = (i + 1) / total_files * 100 if total_files > 0 else 0
+                    filled = int(pct / 5)
+                    bar = "█" * filled + "░" * (20 - filled)
+                    try:
+                        await status.edit_text(
+                            f"🔍 **SCANNING** `{domain}`\n"
+                            f"`[{bar}]` **{pct:.1f}%**\n"
+                            f"📂 Files: **{i+1:,}** / **{total_files:,}**\n"
+                            f"🚀 Speed: **{speed:.0f} files/s**\n"
+                            f"⏳ ETA: **{eta_str}**\n"
+                            f"🍪 Found so far: **{total_matches:,}** cookies in **{counter-1}** files",
+                            parse_mode=enums.ParseMode.MARKDOWN
+                        )
+                    except: pass
+
         if total_matches > 0:
             await status.edit_text(
-                f"🎉 **{total_matches} valid cookies** for `{domain}`\n"
-                f"📁 {scanned} files scanned | 📄 {counter-1} output files\n"
+                f"🎉 **Done!** `{domain}`\n"
+                f"🍪 **{total_matches:,} cookies** in **{counter-1}** files\n"
+                f"📂 Scanned **{total_files:,}** cookie files\n"
                 f"📦 Sending ZIP...",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -419,9 +453,8 @@ async def process_archive(client: Client, message: Message):
                 message.chat.id,
                 document=output_zip_path,
                 caption=(
-                    f"🍪 **{total_matches} cookies** for `{domain}`\n"
-                    f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{counter-1}.txt`\n"
-                    f"✅ Garbage/binary lines filtered"
+                    f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
+                    f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{counter-1}.txt`"
                 ),
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -429,7 +462,7 @@ async def process_archive(client: Client, message: Message):
         else:
             await status.edit_text(
                 f"❌ **No valid cookies** found for `{domain}`\n"
-                f"📁 {scanned} files scanned"
+                f"📂 Scanned **{total_files:,}** files"
             )
 
     except Exception as e:
