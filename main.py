@@ -8,6 +8,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 
+try:
+    import rarfile
+    RAR_SUPPORTED = True
+except ImportError:
+    RAR_SUPPORTED = False
+    print("⚠️ rarfile not installed - RAR support disabled")
+
 BOT_TOKEN = "8663784484:AAEDaOYGkT8cCnkBvVaCNEp4fjQL3pgDPlQ"
 API_ID = 32201838
 API_HASH = "5e270d2e3ed53eb5d37c8f8016ff4bcd"
@@ -42,16 +49,34 @@ def is_cookie_file(fname: str) -> bool:
             return True
     return False
 
-# ── Check if ZIP is password protected ───────────────────────────────────────
+def is_archive(fname: str) -> bool:
+    lower = fname.lower()
+    return lower.endswith('.zip') or lower.endswith('.rar')
+
+# ── Encryption detection ──────────────────────────────────────────────────────
 def is_zip_encrypted(zip_path: str) -> bool:
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for member in zf.infolist():
-                if member.flag_bits & 0x1:  # encryption flag
+                if member.flag_bits & 0x1:
                     return True
         return False
     except:
         return False
+
+def is_rar_encrypted(rar_path: str) -> bool:
+    if not RAR_SUPPORTED:
+        return False
+    try:
+        with rarfile.RarFile(rar_path, 'r') as rf:
+            return rf.needs_password()
+    except:
+        return False
+
+def is_encrypted(path: str) -> bool:
+    if path.lower().endswith('.rar'):
+        return is_rar_encrypted(path)
+    return is_zip_encrypted(path)
 
 # ── Validate cookie line ──────────────────────────────────────────────────────
 def is_valid_netscape_line(parts: list) -> bool:
@@ -91,7 +116,7 @@ def parse_netscape_cookies(text: str, domain_filter: str):
             results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
     return results
 
-# ── Recursive ZIP collector (with optional password) ─────────────────────────
+# ── Recursive archive collector ───────────────────────────────────────────────
 def collect_cookie_files_from_zip(zip_path: str, password: bytes = None, depth: int = 0, max_depth: int = 6):
     results = []
     if depth > max_depth:
@@ -103,19 +128,17 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None, depth: 
                     continue
                 fname = member.filename
                 basename = os.path.basename(fname)
-
-                if basename.lower().endswith('.zip'):
+                if is_archive(basename):
                     try:
                         data = zf.read(member, pwd=password)
                         nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
                         with open(nested_path, 'wb') as f:
                             f.write(data)
-                        nested = collect_cookie_files_from_zip(nested_path, password, depth + 1, max_depth)
+                        nested = collect_from_archive(nested_path, password, depth + 1, max_depth)
                         results.extend(nested)
                         os.remove(nested_path)
                     except Exception as e:
-                        print(f"⚠️ Nested ZIP error {basename}: {e}")
-
+                        print(f"⚠️ Nested archive error {basename}: {e}")
                 elif is_cookie_file(basename):
                     try:
                         content = zf.read(member, pwd=password)
@@ -128,19 +151,73 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None, depth: 
         print(f"⚠️ ZIP open error: {e}")
     return results
 
-# ── Text handler (domain + password) ─────────────────────────────────────────
+def collect_cookie_files_from_rar(rar_path: str, password: str = None, depth: int = 0, max_depth: int = 6):
+    results = []
+    if not RAR_SUPPORTED or depth > max_depth:
+        return results
+    try:
+        with rarfile.RarFile(rar_path, 'r') as rf:
+            if password:
+                rf.setpassword(password)
+            for member in rf.infolist():
+                if member.is_dir():
+                    continue
+                fname = member.filename
+                basename = os.path.basename(fname)
+                if is_archive(basename):
+                    try:
+                        data = rf.read(member)
+                        nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
+                        with open(nested_path, 'wb') as f:
+                            f.write(data)
+                        nested = collect_from_archive(nested_path, password.encode() if password else None, depth + 1, max_depth)
+                        results.extend(nested)
+                        os.remove(nested_path)
+                    except Exception as e:
+                        print(f"⚠️ Nested archive error {basename}: {e}")
+                elif is_cookie_file(basename):
+                    try:
+                        content = rf.read(member)
+                        results.append((fname, content))
+                    except Exception as e:
+                        print(f"⚠️ Read error {fname}: {e}")
+    except rarfile.BadRarFile:
+        print(f"⚠️ Bad RAR: {rar_path}")
+    except Exception as e:
+        print(f"⚠️ RAR open error: {e}")
+    return results
+
+def collect_from_archive(path: str, password: bytes = None, depth: int = 0, max_depth: int = 6):
+    if path.lower().endswith('.rar'):
+        pwd_str = password.decode('utf-8', errors='ignore') if password else None
+        return collect_cookie_files_from_rar(path, pwd_str, depth, max_depth)
+    return collect_cookie_files_from_zip(path, password, depth, max_depth)
+
+def test_archive_password(path: str, password: bytes) -> bool:
+    """Test if a password is correct for an archive."""
+    try:
+        if path.lower().endswith('.rar'):
+            with rarfile.RarFile(path, 'r') as rf:
+                rf.setpassword(password.decode('utf-8', errors='ignore'))
+                first = next(m for m in rf.infolist() if not m.is_dir())
+                rf.read(first)
+        else:
+            with zipfile.ZipFile(path, 'r') as zf:
+                first = next(m for m in zf.infolist() if not m.is_dir())
+                zf.read(first, pwd=password)
+        return True
+    except:
+        return False
+
+# ── Text handler (password + domain) ─────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else 0
-
-    # Check password first
     if uid in pending_passwords:
         future = pending_passwords.pop(uid)
         if not future.done():
             future.get_loop().call_soon_threadsafe(future.set_result, message.text.strip())
         return
-
-    # Then domain
     if uid in pending_domains:
         future = pending_domains.pop(uid)
         if not future.done():
@@ -148,41 +225,49 @@ async def text_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
+    rar_status = "✅ RAR supported" if RAR_SUPPORTED else "⚠️ RAR not available"
     await message.reply(
         "**🚀 Cookie Bot READY**\n\n"
-        "🔹 Send a ZIP file\n"
+        "🔹 Send a ZIP or RAR file\n"
         "🔹 Bot asks for domain\n"
         "🔹 Type `netflix.com`\n"
         "🔹 Receive `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
-        "🔐 Password-protected ZIPs supported\n"
-        "✅ Only valid Netscape cookies saved\n"
-        "✅ Nested ZIPs supported",
+        f"🔐 Password-protected archives supported\n"
+        f"📦 {rar_status}\n"
+        "✅ Only valid Netscape cookies saved",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
 @app.on_message(filters.document)
 async def doc_handler(client: Client, message: Message):
-    doc_name = message.document.file_name if message.document else None
-    if doc_name and 'zip' in doc_name.lower():
-        await process_zip(client, message)
+    doc_name = message.document.file_name if message.document else ""
+    doc_lower = doc_name.lower()
+    if doc_lower.endswith('.zip') or doc_lower.endswith('.rar'):
+        await process_archive(client, message)
     else:
-        await message.reply("❌ **ZIP file only** please!", parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply("❌ **ZIP or RAR file only** please!", parse_mode=enums.ParseMode.MARKDOWN)
 
-async def process_zip(client: Client, message: Message):
+async def process_archive(client: Client, message: Message):
     doc = message.document
     fname = doc.file_name or "upload.zip"
     filesize = doc.file_size or 0
     uid = message.from_user.id
+    is_rar = fname.lower().endswith('.rar')
+
+    if is_rar and not RAR_SUPPORTED:
+        await message.reply("❌ **RAR not supported** on this server. Send a ZIP instead.")
+        return
 
     if filesize > 2e9:
         await message.reply("❌ Max 2GB")
         return
 
     start_time = time.time()
-    zip_path = f"/tmp/{uid}_{int(time.time())}.zip"
+    ext = '.rar' if is_rar else '.zip'
+    archive_path = f"/tmp/{uid}_{int(time.time())}{ext}"
     status = await message.reply("⬇️ **Downloading...**")
 
-    # ── Progress bar with speed + ETA ────────────────────────────────────────
+    # ── Progress bar ──────────────────────────────────────────────────────────
     last_update_time = [time.time()]
     last_update_bytes = [0]
 
@@ -218,50 +303,49 @@ async def process_zip(client: Client, message: Message):
         except: pass
 
     try:
-        await client.download_media(message, file_name=zip_path, progress=progress)
+        await client.download_media(message, file_name=archive_path, progress=progress)
     except Exception as e:
         await status.edit_text(f"❌ **Download failed**: {e}")
-        if os.path.exists(zip_path): os.remove(zip_path)
+        if os.path.exists(archive_path): os.remove(archive_path)
         return
 
     elapsed = time.time() - start_time
     avg_speed = filesize / elapsed if elapsed > 0 else 0
     avg_str = f"{avg_speed/1_000_000:.1f} MB/s" if avg_speed >= 1_000_000 else f"{avg_speed/1_000:.0f} KB/s"
 
-    # ── Check if ZIP is password protected ───────────────────────────────────
-    zip_password = None
-    if is_zip_encrypted(zip_path):
+    # ── Check password ────────────────────────────────────────────────────────
+    archive_password = None
+    if is_encrypted(archive_path):
         await status.edit_text(
             f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s @ {avg_str}\n\n"
-            f"🔐 **ZIP is password protected!**\n"
+            f"🔐 **Archive is password protected!**\n"
             f"Please send the password now:",
             parse_mode=enums.ParseMode.MARKDOWN
         )
-
         loop = asyncio.get_event_loop()
         pwd_future = loop.create_future()
         pending_passwords[uid] = pwd_future
-
         try:
             pwd_text = await asyncio.wait_for(pwd_future, timeout=60)
-            zip_password = pwd_text.encode('utf-8')
-            print(f"🔐 Password received")
+            archive_password = pwd_text.encode('utf-8')
 
-            # Test the password
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    first = next(m for m in zf.infolist() if not m.is_dir())
-                    zf.read(first, pwd=zip_password)
-            except RuntimeError:
-                await status.edit_text("❌ **Wrong password!** Send the ZIP again.")
-                if os.path.exists(zip_path): os.remove(zip_path)
+            if not test_archive_password(archive_path, archive_password):
+                await status.edit_text("❌ **Wrong password!** Send the archive again.")
+                if os.path.exists(archive_path): os.remove(archive_path)
                 return
 
         except asyncio.TimeoutError:
             pending_passwords.pop(uid, None)
-            await status.edit_text("⏰ **Timed out waiting for password.** Send ZIP again.")
-            if os.path.exists(zip_path): os.remove(zip_path)
+            await status.edit_text("⏰ **Timed out waiting for password.** Send archive again.")
+            if os.path.exists(archive_path): os.remove(archive_path)
             return
+
+        await status.edit_text(
+            f"✅ **Password correct!**\n\n"
+            f"📝 **Send the domain name now:**\n"
+            f"Example: `netflix.com` or `instagram.com`",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
     else:
         await status.edit_text(
             f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s @ {avg_str}\n\n"
@@ -270,26 +354,16 @@ async def process_zip(client: Client, message: Message):
             parse_mode=enums.ParseMode.MARKDOWN
         )
 
-    # ── Ask for domain ────────────────────────────────────────────────────────
-    if zip_password:
-        await status.edit_text(
-            f"✅ **Password correct!**\n\n"
-            f"📝 **Send the domain name now:**\n"
-            f"Example: `netflix.com` or `instagram.com`",
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
-
+    # ── Wait for domain ───────────────────────────────────────────────────────
     loop = asyncio.get_event_loop()
     domain_future = loop.create_future()
     pending_domains[uid] = domain_future
-
     try:
         domain = await asyncio.wait_for(domain_future, timeout=60)
-        print(f"🌐 DOMAIN: {domain}")
     except asyncio.TimeoutError:
         pending_domains.pop(uid, None)
-        await status.edit_text("⏰ **Timed out.** Send ZIP again.")
-        if os.path.exists(zip_path): os.remove(zip_path)
+        await status.edit_text("⏰ **Timed out.** Send archive again.")
+        if os.path.exists(archive_path): os.remove(archive_path)
         return
 
     await status.edit_text(f"🔍 **Scanning for `{domain}` cookies...**")
@@ -301,13 +375,13 @@ async def process_zip(client: Client, message: Message):
     scanned = 0
 
     try:
-        cookie_files = collect_cookie_files_from_zip(zip_path, password=zip_password)
+        cookie_files = collect_from_archive(archive_path, archive_password)
         scanned = len(cookie_files)
         print(f"📁 Found {scanned} cookie files")
 
-        if os.path.exists(zip_path):
-            os.remove(zip_path)
-            print("🧹 Input ZIP deleted")
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+            print("🧹 Input archive deleted")
 
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf_out:
             for (orig_path, content_bytes) in cookie_files:
@@ -336,7 +410,7 @@ async def process_zip(client: Client, message: Message):
                 caption=(
                     f"🍪 **{total_matches} cookies** for `{domain}`\n"
                     f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{counter-1}.txt`\n"
-                    f"✅ All garbage/binary lines filtered out"
+                    f"✅ Garbage/binary lines filtered"
                 ),
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -350,14 +424,14 @@ async def process_zip(client: Client, message: Message):
     except Exception as e:
         print(f"❌ ERROR: {e}")
         await status.edit_text(f"❌ **Error**: {e}")
-        if os.path.exists(zip_path): os.remove(zip_path)
+        if os.path.exists(archive_path): os.remove(archive_path)
 
     finally:
         if os.path.exists(output_zip_path):
             os.remove(output_zip_path)
             print("🧹 Output ZIP deleted")
 
-# ── Fake web server for Render free tier ─────────────────────────────────────
+# ── Fake web server for Render ────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
