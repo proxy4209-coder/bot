@@ -81,44 +81,25 @@ def is_encrypted(path: str) -> bool:
 # ── FIXED domain matching (no more substring bugs!) ──────────────────────────
 def domain_matches(cookie_domain: str, search_domain: str) -> bool:
     """
-    Properly match cookie domain against user's search domain.
-    e.g. search 'netflix.com' should match '.netflix.com' and 'netflix.com'
-    but NOT 'x.com' even though 'x.com' is a substring of 'netflix.com'
+    Match cookie domain against search domain using proper boundary check.
+    Fixes: 'x.com' in 'netflix.com' = True (wrong!) 
+    Now:   only matches on dot boundaries.
     """
     cookie_domain = cookie_domain.lower().lstrip(".")
     search_domain = search_domain.lower().lstrip(".")
 
-    # Exact match
+    # Exact match: netflix.com == netflix.com
     if cookie_domain == search_domain:
         return True
-    # Cookie domain is a subdomain of search domain: e.g. jobs.netflix.com matches netflix.com
+    # Cookie is subdomain: jobs.netflix.com ends with .netflix.com
     if cookie_domain.endswith("." + search_domain):
         return True
-    # Search domain is a subdomain of cookie domain: e.g. search 'jobs.netflix.com', cookie '.netflix.com'
+    # Search is more specific than cookie: search=jobs.netflix.com, cookie=netflix.com
     if search_domain.endswith("." + cookie_domain):
         return True
     return False
 
-# ── Validate cookie line ──────────────────────────────────────────────────────
-def is_valid_netscape_line(parts: list) -> bool:
-    if len(parts) < 7:
-        return False
-    domain, flag, path, secure, expiry, name, value = parts[:7]
-    if not domain or '.' not in domain:
-        return False
-    if flag.upper() not in ('TRUE', 'FALSE'):
-        return False
-    if not path.startswith('/'):
-        return False
-    if secure.upper() not in ('TRUE', 'FALSE'):
-        return False
-    if not expiry.isdigit():
-        return False
-    if not name or ' ' in name or not name.isprintable():
-        return False
-    return True
-
-# ── Netscape cookie parser ────────────────────────────────────────────────────
+# ── Netscape cookie parser (matches CLI logic exactly) ───────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     results = []
     for line in text.splitlines():
@@ -128,11 +109,16 @@ def parse_netscape_cookies(text: str, domain_filter: str):
         parts = line.split("\t")
         if len(parts) < 7:
             parts = re.split(r"\s+", line, maxsplit=6)
-        if not is_valid_netscape_line(parts):
+        if len(parts) < 7:
             continue
-        domain = parts[0]
+        domain, flag, path, secure, expiry, name, value = parts[:7]
+        # Only require minimum valid structure (same as CLI tool)
+        if not domain or '.' not in domain:
+            continue
+        if len(parts) < 7:
+            continue
         if domain_matches(domain, domain_filter):
-            results.append("\t".join(parts[:7]))
+            results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
     return results
 
 # ── Recursive archive collector ───────────────────────────────────────────────
