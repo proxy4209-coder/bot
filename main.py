@@ -200,14 +200,25 @@ def test_archive_password(path: str, password: bytes) -> bool:
             with rarfile.RarFile(path, 'r') as rf:
                 rf.setpassword(password.decode('utf-8', errors='ignore'))
                 first = next(m for m in rf.infolist() if not m.is_dir())
-                rf.read(first)
+                try:
+                    rf.read(first)
+                except rarfile.BadRarFile:
+                    return False  # definitely wrong password
+                except Exception:
+                    pass  # other errors (CRC etc) - password may still be correct
         else:
             with zipfile.ZipFile(path, 'r') as zf:
                 first = next(m for m in zf.infolist() if not m.is_dir())
-                zf.read(first, pwd=password)
+                try:
+                    zf.read(first, pwd=password)
+                except RuntimeError as e:
+                    if 'password' in str(e).lower() or 'Bad password' in str(e):
+                        return False
+                except Exception:
+                    pass
         return True
-    except:
-        return False
+    except Exception:
+        return True  # if we cant even open it, assume password is fine and let it fail later
 
 # ── Text handler (password + domain) ─────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command("start"))
