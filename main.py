@@ -13,7 +13,6 @@ try:
     RAR_SUPPORTED = True
 except ImportError:
     RAR_SUPPORTED = False
-    print("⚠️ rarfile not installed - RAR support disabled")
 
 BOT_TOKEN = "8663784484:AAEDaOYGkT8cCnkBvVaCNEp4fjQL3pgDPlQ"
 API_ID = 32201838
@@ -78,124 +77,6 @@ def is_encrypted(path: str) -> bool:
         return is_rar_encrypted(path)
     return is_zip_encrypted(path)
 
-# ── FIXED domain matching (no more substring bugs!) ──────────────────────────
-def domain_matches(cookie_domain: str, search_domain: str) -> bool:
-    """
-    Match cookie domain against search domain using proper boundary check.
-    Fixes: 'x.com' in 'netflix.com' = True (wrong!) 
-    Now:   only matches on dot boundaries.
-    """
-    cookie_domain = cookie_domain.lower().lstrip(".")
-    search_domain = search_domain.lower().lstrip(".")
-
-    # Exact match: netflix.com == netflix.com
-    if cookie_domain == search_domain:
-        return True
-    # Cookie is subdomain: jobs.netflix.com ends with .netflix.com
-    if cookie_domain.endswith("." + search_domain):
-        return True
-    # Search is more specific than cookie: search=jobs.netflix.com, cookie=netflix.com
-    if search_domain.endswith("." + cookie_domain):
-        return True
-    return False
-
-# ── Netscape cookie parser (matches CLI logic exactly) ───────────────────────
-def parse_netscape_cookies(text: str, domain_filter: str):
-    results = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) < 7:
-            parts = re.split(r"\s+", line, maxsplit=6)
-        if len(parts) < 7:
-            continue
-        domain, flag, path, secure, expiry, name, value = parts[:7]
-        # Only require minimum valid structure (same as CLI tool)
-        if not domain or '.' not in domain:
-            continue
-        if len(parts) < 7:
-            continue
-        if domain_matches(domain, domain_filter):
-            results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
-    return results
-
-# ── Recursive archive collector ───────────────────────────────────────────────
-def collect_cookie_files_from_zip(zip_path: str, password: bytes = None, depth: int = 0, max_depth: int = 6):
-    results = []
-    if depth > max_depth:
-        return results
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            for member in zf.infolist():
-                if member.is_dir():
-                    continue
-                fname = member.filename
-                basename = os.path.basename(fname)
-                if is_archive(basename):
-                    try:
-                        data = zf.read(member, pwd=password)
-                        nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
-                        with open(nested_path, 'wb') as f:
-                            f.write(data)
-                        nested = collect_from_archive(nested_path, password, depth + 1, max_depth)
-                        results.extend(nested)
-                        os.remove(nested_path)
-                    except Exception as e:
-                        print(f"⚠️ Nested archive error {basename}: {e}")
-                elif is_cookie_file(basename):
-                    try:
-                        content = zf.read(member, pwd=password)
-                        results.append((fname, content))
-                    except Exception as e:
-                        print(f"⚠️ Read error {fname}: {e}")
-    except zipfile.BadZipFile:
-        print(f"⚠️ Bad ZIP: {zip_path}")
-    except Exception as e:
-        print(f"⚠️ ZIP open error: {e}")
-    return results
-
-def collect_cookie_files_from_rar(rar_path: str, password: str = None, depth: int = 0, max_depth: int = 6):
-    results = []
-    if not RAR_SUPPORTED or depth > max_depth:
-        return results
-    try:
-        with rarfile.RarFile(rar_path, 'r') as rf:
-            if password:
-                rf.setpassword(password)
-            for member in rf.infolist():
-                if member.is_dir():
-                    continue
-                fname = member.filename
-                basename = os.path.basename(fname)
-                if is_archive(basename):
-                    try:
-                        data = rf.read(member)
-                        nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
-                        with open(nested_path, 'wb') as f:
-                            f.write(data)
-                        nested = collect_from_archive(nested_path, password.encode() if password else None, depth + 1, max_depth)
-                        results.extend(nested)
-                        os.remove(nested_path)
-                    except Exception as e:
-                        print(f"⚠️ Nested archive error {basename}: {e}")
-                elif is_cookie_file(basename):
-                    try:
-                        content = rf.read(member)
-                        results.append((fname, content))
-                    except Exception as e:
-                        print(f"⚠️ Read error {fname}: {e}")
-    except Exception as e:
-        print(f"⚠️ RAR open error: {e}")
-    return results
-
-def collect_from_archive(path: str, password: bytes = None, depth: int = 0, max_depth: int = 6):
-    if path.lower().endswith('.rar'):
-        pwd_str = password.decode('utf-8', errors='ignore') if password else None
-        return collect_cookie_files_from_rar(path, pwd_str, depth, max_depth)
-    return collect_cookie_files_from_zip(path, password, depth, max_depth)
-
 def test_archive_password(path: str, password: bytes) -> bool:
     try:
         if path.lower().endswith('.rar'):
@@ -222,7 +103,170 @@ def test_archive_password(path: str, password: bytes) -> bool:
     except Exception:
         return True
 
-# ── Text handler ──────────────────────────────────────────────────────────────
+# ── Domain matching (proper boundary check) ───────────────────────────────────
+def domain_matches(cookie_domain: str, search_domain: str) -> bool:
+    cookie_domain = cookie_domain.lower().lstrip(".")
+    search_domain = search_domain.lower().lstrip(".")
+    if cookie_domain == search_domain:
+        return True
+    if cookie_domain.endswith("." + search_domain):
+        return True
+    if search_domain.endswith("." + cookie_domain):
+        return True
+    return False
+
+# ── Netscape cookie parser (same as CLI) ─────────────────────────────────────
+def parse_netscape_cookies(text: str, domain_filter: str):
+    results = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            parts = re.split(r"\s+", line, maxsplit=6)
+        if len(parts) < 7:
+            continue
+        domain, flag, path, secure, expiry, name, value = parts[:7]
+        if not domain or '.' not in domain:
+            continue
+        if domain_matches(domain, domain_filter):
+            results.append("\t".join([domain, flag, path, secure, expiry, name, value]))
+    return results
+
+# ── PHASE 1: Count all files inside archive ───────────────────────────────────
+def count_archive_contents(path: str, password: bytes = None) -> dict:
+    """Returns {total_files, total_folders, cookie_files, zip_files}"""
+    total_files = 0
+    total_folders = 0
+    cookie_files = 0
+    nested_zips = 0
+    try:
+        if path.lower().endswith('.rar') and RAR_SUPPORTED:
+            with rarfile.RarFile(path, 'r') as rf:
+                if password:
+                    rf.setpassword(password.decode('utf-8', errors='ignore'))
+                for m in rf.infolist():
+                    if m.is_dir():
+                        total_folders += 1
+                    else:
+                        total_files += 1
+                        if is_cookie_file(m.filename):
+                            cookie_files += 1
+                        if is_archive(m.filename):
+                            nested_zips += 1
+        else:
+            with zipfile.ZipFile(path, 'r') as zf:
+                for m in zf.infolist():
+                    if m.is_dir():
+                        total_folders += 1
+                    else:
+                        total_files += 1
+                        if is_cookie_file(m.filename):
+                            cookie_files += 1
+                        if is_archive(m.filename):
+                            nested_zips += 1
+    except Exception as e:
+        print(f"⚠️ Count error: {e}")
+    return {
+        "total_files": total_files,
+        "total_folders": total_folders,
+        "cookie_files": cookie_files,
+        "nested_zips": nested_zips,
+    }
+
+# ── PHASE 2: Extract with progress callback ───────────────────────────────────
+def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
+                                   depth: int = 0, max_depth: int = 6,
+                                   progress_cb=None, counter=None):
+    results = []
+    if depth > max_depth:
+        return results
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            members = zf.infolist()
+            for member in members:
+                if member.is_dir():
+                    continue
+                fname = member.filename
+                basename = os.path.basename(fname)
+                if is_archive(basename):
+                    try:
+                        data = zf.read(member, pwd=password)
+                        nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
+                        with open(nested_path, 'wb') as f:
+                            f.write(data)
+                        nested = collect_from_archive(nested_path, password, depth + 1, max_depth, progress_cb, counter)
+                        results.extend(nested)
+                        os.remove(nested_path)
+                    except Exception as e:
+                        print(f"⚠️ Nested error {basename}: {e}")
+                elif is_cookie_file(basename):
+                    try:
+                        content = zf.read(member, pwd=password)
+                        results.append((fname, content))
+                    except Exception as e:
+                        print(f"⚠️ Read error {fname}: {e}")
+                # tick progress
+                if counter is not None:
+                    counter[0] += 1
+                    if progress_cb and counter[0] % 500 == 0:
+                        progress_cb(counter[0])
+    except zipfile.BadZipFile:
+        pass
+    except Exception as e:
+        print(f"⚠️ ZIP error: {e}")
+    return results
+
+def collect_cookie_files_from_rar(rar_path: str, password: str = None,
+                                   depth: int = 0, max_depth: int = 6,
+                                   progress_cb=None, counter=None):
+    results = []
+    if not RAR_SUPPORTED or depth > max_depth:
+        return results
+    try:
+        with rarfile.RarFile(rar_path, 'r') as rf:
+            if password:
+                rf.setpassword(password)
+            for member in rf.infolist():
+                if member.is_dir():
+                    continue
+                fname = member.filename
+                basename = os.path.basename(fname)
+                if is_archive(basename):
+                    try:
+                        data = rf.read(member)
+                        nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
+                        with open(nested_path, 'wb') as f:
+                            f.write(data)
+                        nested = collect_from_archive(nested_path, password.encode() if password else None,
+                                                      depth + 1, max_depth, progress_cb, counter)
+                        results.extend(nested)
+                        os.remove(nested_path)
+                    except Exception as e:
+                        print(f"⚠️ Nested error {basename}: {e}")
+                elif is_cookie_file(basename):
+                    try:
+                        content = rf.read(member)
+                        results.append((fname, content))
+                    except Exception as e:
+                        print(f"⚠️ Read error {fname}: {e}")
+                if counter is not None:
+                    counter[0] += 1
+                    if progress_cb and counter[0] % 500 == 0:
+                        progress_cb(counter[0])
+    except Exception as e:
+        print(f"⚠️ RAR error: {e}")
+    return results
+
+def collect_from_archive(path: str, password: bytes = None, depth: int = 0,
+                         max_depth: int = 6, progress_cb=None, counter=None):
+    if path.lower().endswith('.rar'):
+        pwd_str = password.decode('utf-8', errors='ignore') if password else None
+        return collect_cookie_files_from_rar(path, pwd_str, depth, max_depth, progress_cb, counter)
+    return collect_cookie_files_from_zip(path, password, depth, max_depth, progress_cb, counter)
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command("start"))
 async def text_handler(client: Client, message: Message):
     uid = message.from_user.id if message.from_user else 0
@@ -238,27 +282,24 @@ async def text_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
-    rar_status = "✅ RAR supported" if RAR_SUPPORTED else "⚠️ RAR not available"
     await message.reply(
         "**🚀 Cookie Bot READY**\n\n"
-        "🔹 Send a ZIP or RAR file\n"
-        "🔹 Bot asks for domain\n"
-        "🔹 Type `netflix.com`\n"
-        "🔹 Receive `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
-        f"🔐 Password-protected archives supported\n"
-        f"📦 {rar_status}\n"
-        "✅ Only valid Netscape cookies saved",
+        "🔹 Send ZIP or RAR\n"
+        "🔹 Bot counts → extracts → scans\n"
+        "🔹 Type domain e.g. `netflix.com`\n"
+        "🔹 Get `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
+        f"🔐 Password protected supported\n"
+        f"{'✅ RAR supported' if RAR_SUPPORTED else '⚠️ RAR unavailable'}",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
 @app.on_message(filters.document)
 async def doc_handler(client: Client, message: Message):
     doc_name = message.document.file_name if message.document else ""
-    doc_lower = doc_name.lower()
-    if doc_lower.endswith('.zip') or doc_lower.endswith('.rar'):
+    if doc_name.lower().endswith('.zip') or doc_name.lower().endswith('.rar'):
         await process_archive(client, message)
     else:
-        await message.reply("❌ **ZIP or RAR file only** please!", parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply("❌ **ZIP or RAR only**", parse_mode=enums.ParseMode.MARKDOWN)
 
 async def process_archive(client: Client, message: Message):
     doc = message.document
@@ -268,126 +309,203 @@ async def process_archive(client: Client, message: Message):
     is_rar = fname.lower().endswith('.rar')
 
     if is_rar and not RAR_SUPPORTED:
-        await message.reply("❌ **RAR not supported** on this server.")
+        await message.reply("❌ RAR not supported on this server.")
         return
     if filesize > 2e9:
         await message.reply("❌ Max 2GB")
         return
 
-    start_time = time.time()
     ext = '.rar' if is_rar else '.zip'
     archive_path = f"/tmp/{uid}_{int(time.time())}{ext}"
+
+    # ── DOWNLOAD ──────────────────────────────────────────────────────────────
     status = await message.reply("⬇️ **Downloading...**")
+    dl_start = time.time()
+    last_t = [time.time()]
+    last_b = [0]
 
-    # ── Download progress bar ─────────────────────────────────────────────────
-    last_update_time = [time.time()]
-    last_update_bytes = [0]
-
-    async def progress(current, total):
+    async def dl_progress(current, total):
         now = time.time()
-        elapsed_since_last = now - last_update_time[0]
-        if elapsed_since_last < 2.0:
+        if now - last_t[0] < 2.0:
             return
-        bytes_since_last = current - last_update_bytes[0]
-        speed_bps = bytes_since_last / elapsed_since_last if elapsed_since_last > 0 else 0
-        remaining = total - current
-        eta = int(remaining / speed_bps) if speed_bps > 0 else 0
-        last_update_time[0] = now
-        last_update_bytes[0] = current
+        dt = now - last_t[0]
+        db = current - last_b[0]
+        speed = db / dt if dt > 0 else 0
+        eta = int((total - current) / speed) if speed > 0 else 0
+        last_t[0] = now
+        last_b[0] = current
         pct = current / total * 100
-        filled = int(pct / 5)
-        bar = "█" * filled + "░" * (20 - filled)
-        speed_str = f"{speed_bps/1_000_000:.1f} MB/s" if speed_bps >= 1_000_000 else f"{speed_bps/1_000:.0f} KB/s"
-        eta_str = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
+        bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+        spd = f"{speed/1e6:.1f} MB/s" if speed >= 1e6 else f"{speed/1e3:.0f} KB/s"
+        eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
         try:
             await status.edit_text(
                 f"⬇️ **Downloading** `{fname}`\n"
                 f"`[{bar}]` **{pct:.1f}%**\n"
                 f"📦 {current/1e6:.1f} / {total/1e6:.1f} MB\n"
-                f"⚡ **{speed_str}** | ⏱️ ETA: **{eta_str}**",
+                f"⚡ **{spd}** | ⏱️ ETA: **{eta_s}**",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
         except: pass
 
     try:
-        await client.download_media(message, file_name=archive_path, progress=progress)
+        await client.download_media(message, file_name=archive_path, progress=dl_progress)
     except Exception as e:
-        await status.edit_text(f"❌ **Download failed**: {e}")
+        await status.edit_text(f"❌ Download failed: {e}")
         if os.path.exists(archive_path): os.remove(archive_path)
         return
 
-    elapsed = time.time() - start_time
-    avg_speed = filesize / elapsed if elapsed > 0 else 0
-    avg_str = f"{avg_speed/1_000_000:.1f} MB/s" if avg_speed >= 1_000_000 else f"{avg_speed/1_000:.0f} KB/s"
+    dl_elapsed = time.time() - dl_start
+    avg_spd = filesize / dl_elapsed if dl_elapsed > 0 else 0
+    avg_str = f"{avg_spd/1e6:.1f} MB/s" if avg_spd >= 1e6 else f"{avg_spd/1e3:.0f} KB/s"
 
-    # ── Password check ────────────────────────────────────────────────────────
+    # ── PASSWORD ──────────────────────────────────────────────────────────────
     archive_password = None
     if is_encrypted(archive_path):
         await status.edit_text(
-            f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s @ {avg_str}\n\n"
-            f"🔐 **Archive is password protected!**\n"
-            f"Please send the password now:",
+            f"✅ **Downloaded** `{fname}` — {dl_elapsed:.1f}s @ {avg_str}\n\n"
+            f"🔐 **Password protected!** Send password now:",
             parse_mode=enums.ParseMode.MARKDOWN
         )
         loop = asyncio.get_event_loop()
-        pwd_future = loop.create_future()
-        pending_passwords[uid] = pwd_future
+        pf = loop.create_future()
+        pending_passwords[uid] = pf
         try:
-            pwd_text = await asyncio.wait_for(pwd_future, timeout=60)
+            pwd_text = await asyncio.wait_for(pf, timeout=60)
             archive_password = pwd_text.encode('utf-8')
             if not test_archive_password(archive_path, archive_password):
-                await status.edit_text("❌ **Wrong password!** Send the archive again.")
-                if os.path.exists(archive_path): os.remove(archive_path)
+                await status.edit_text("❌ **Wrong password!** Send archive again.")
+                os.remove(archive_path)
                 return
         except asyncio.TimeoutError:
             pending_passwords.pop(uid, None)
-            await status.edit_text("⏰ **Timed out.** Send archive again.")
-            if os.path.exists(archive_path): os.remove(archive_path)
+            await status.edit_text("⏰ Timed out. Send archive again.")
+            os.remove(archive_path)
             return
-
         await status.edit_text(
             f"✅ **Password correct!**\n\n"
-            f"📝 **Send the domain name now:**\n"
-            f"Example: `netflix.com` or `instagram.com`",
+            f"📝 Send domain: e.g. `netflix.com`",
             parse_mode=enums.ParseMode.MARKDOWN
         )
     else:
         await status.edit_text(
-            f"✅ **Downloaded** `{fname}` in {elapsed:.1f}s @ {avg_str}\n\n"
-            f"📝 **Send the domain name now:**\n"
-            f"Example: `netflix.com` or `instagram.com`",
+            f"✅ **Downloaded** `{fname}` — {dl_elapsed:.1f}s @ {avg_str}\n\n"
+            f"📝 Send domain: e.g. `netflix.com`",
             parse_mode=enums.ParseMode.MARKDOWN
         )
 
-    # ── Wait for domain ───────────────────────────────────────────────────────
+    # ── DOMAIN ────────────────────────────────────────────────────────────────
     loop = asyncio.get_event_loop()
-    domain_future = loop.create_future()
-    pending_domains[uid] = domain_future
+    df = loop.create_future()
+    pending_domains[uid] = df
     try:
-        domain = await asyncio.wait_for(domain_future, timeout=60)
+        domain = await asyncio.wait_for(df, timeout=60)
     except asyncio.TimeoutError:
         pending_domains.pop(uid, None)
-        await status.edit_text("⏰ **Timed out.** Send archive again.")
-        if os.path.exists(archive_path): os.remove(archive_path)
+        await status.edit_text("⏰ Timed out. Send archive again.")
+        os.remove(archive_path)
         return
 
-    # ── Collect files first (to get total count for progress) ────────────────
-    await status.edit_text(f"📂 **Indexing files...**", parse_mode=enums.ParseMode.MARKDOWN)
-    cookie_files = collect_from_archive(archive_path, archive_password)
-    total_files = len(cookie_files)
-    print(f"📁 Found {total_files} cookie files")
+    domain_prefix = domain.upper().split(".")[0]
 
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 1 — COUNT
+    # ════════════════════════════════════════════════════════════════════════
+    await status.edit_text(
+        f"🔎 **Phase 1/3 — Counting files...**\n"
+        f"📦 `{fname}`",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    counts = count_archive_contents(archive_path, archive_password)
+    total_files   = counts["total_files"]
+    total_folders = counts["total_folders"]
+    cookie_files_count = counts["cookie_files"]
+    nested_zips   = counts["nested_zips"]
+
+    await status.edit_text(
+        f"📊 **Archive Contents:**\n"
+        f"📁 Folders: **{total_folders:,}**\n"
+        f"📄 Files: **{total_files:,}**\n"
+        f"🍪 Cookie files: **{cookie_files_count:,}**\n"
+        f"🗜️ Nested ZIPs/RARs: **{nested_zips:,}**\n\n"
+        f"⏳ Starting extraction...",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    await asyncio.sleep(1.5)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 2 — EXTRACT (collect cookie files with progress)
+    # ════════════════════════════════════════════════════════════════════════
+    extract_start = time.time()
+    extracted_counter = [0]
+    last_extract_update = [0]
+
+    # We run extraction in a thread so we can update progress from main loop
+    cookie_files_result = []
+    extraction_done = asyncio.Event()
+
+    def run_extraction():
+        def progress_cb(n):
+            pass  # we update from async side
+        result = collect_from_archive(archive_path, archive_password,
+                                      counter=extracted_counter)
+        cookie_files_result.extend(result)
+        extraction_done.set()
+
+    extract_thread = threading.Thread(target=run_extraction, daemon=True)
+    extract_thread.start()
+
+    # Show extraction progress while thread runs
+    while not extraction_done.is_set():
+        await asyncio.sleep(2)
+        now = time.time()
+        elapsed = now - extract_start
+        n = extracted_counter[0]
+        speed = n / elapsed if elapsed > 0 else 0
+        remaining = total_files - n if total_files > 0 else 0
+        eta = int(remaining / speed) if speed > 0 else 0
+        pct = min(n / total_files * 100, 99.9) if total_files > 0 else 0
+        bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+        eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
+        spd_s = f"{speed:.0f} files/s"
+        try:
+            await status.edit_text(
+                f"📂 **Phase 2/3 — Extracting**\n"
+                f"`[{bar}]` **{pct:.1f}%**\n"
+                f"📄 Files: **{n:,}** / **{total_files:,}**\n"
+                f"🚀 Speed: **{spd_s}**\n"
+                f"⏳ ETA: **{eta_s}**\n"
+                f"🍪 Cookie files found: **{len(cookie_files_result):,}**",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+        except: pass
+
+    # Delete input archive
     if os.path.exists(archive_path):
         os.remove(archive_path)
-        print("🧹 Input archive deleted")
 
-    # ── Scan with live progress bar ───────────────────────────────────────────
-    domain_prefix = domain.upper().split(".")[0]
+    cookie_files = cookie_files_result
+    total_cookie_files = len(cookie_files)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PHASE 3 — SCAN COOKIES
+    # ════════════════════════════════════════════════════════════════════════
     output_zip_path = f"/tmp/{uid}_{domain}_results.zip"
     total_matches = 0
     counter = 1
     scan_start = time.time()
     last_scan_update = [0]
+
+    # Show initial scan bar immediately
+    await status.edit_text(
+        f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
+        f"`[░░░░░░░░░░░░░░░░░░░░]` **0.0%**\n"
+        f"📂 Files: **0** / **{total_cookie_files:,}**\n"
+        f"🚀 Speed: **— files/s**\n"
+        f"⏳ ETA: **—**\n"
+        f"🍪 Cookies found: **0**",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
 
     try:
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf_out:
@@ -401,37 +519,38 @@ async def process_archive(client: Client, message: Message):
                         total_matches += len(matches)
                         counter += 1
                 except Exception as e:
-                    print(f"⚠️ Parse error {orig_path}: {e}")
+                    print(f"⚠️ {orig_path}: {e}")
 
-                # Update progress every 2 seconds
+                # Update scan bar every 2s (NEVER delete it)
                 now = time.time()
                 if now - last_scan_update[0] >= 2.0:
                     last_scan_update[0] = now
-                    elapsed_scan = now - scan_start
-                    speed = (i + 1) / elapsed_scan if elapsed_scan > 0 else 0
-                    remaining_files = total_files - (i + 1)
-                    eta_s = int(remaining_files / speed) if speed > 0 else 0
-                    eta_str = f"{eta_s//60}m {eta_s%60}s" if eta_s >= 60 else f"{eta_s}s"
-                    pct = (i + 1) / total_files * 100 if total_files > 0 else 0
-                    filled = int(pct / 5)
-                    bar = "█" * filled + "░" * (20 - filled)
+                    elapsed = now - scan_start
+                    speed = (i + 1) / elapsed if elapsed > 0 else 0
+                    remaining = total_cookie_files - (i + 1)
+                    eta = int(remaining / speed) if speed > 0 else 0
+                    pct = (i + 1) / total_cookie_files * 100 if total_cookie_files > 0 else 0
+                    bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+                    eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
                     try:
                         await status.edit_text(
-                            f"🔍 **SCANNING** `{domain}`\n"
+                            f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
                             f"`[{bar}]` **{pct:.1f}%**\n"
-                            f"📂 Files: **{i+1:,}** / **{total_files:,}**\n"
+                            f"📂 Files: **{i+1:,}** / **{total_cookie_files:,}**\n"
                             f"🚀 Speed: **{speed:.0f} files/s**\n"
-                            f"⏳ ETA: **{eta_str}**\n"
-                            f"🍪 Found so far: **{total_matches:,}** cookies in **{counter-1}** files",
+                            f"⏳ ETA: **{eta_s}**\n"
+                            f"🍪 Cookies found: **{total_matches:,}** in **{counter-1}** files",
                             parse_mode=enums.ParseMode.MARKDOWN
                         )
                     except: pass
 
+        # Final result — UPDATE status (don't delete)
         if total_matches > 0:
             await status.edit_text(
-                f"🎉 **Done!** `{domain}`\n"
-                f"🍪 **{total_matches:,} cookies** in **{counter-1}** files\n"
-                f"📂 Scanned **{total_files:,}** cookie files\n"
+                f"✅ **Done! Scan complete**\n\n"
+                f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
+                f"📄 **{counter-1}** output files\n"
+                f"📂 **{total_cookie_files:,}** cookie files scanned\n\n"
                 f"📦 Sending ZIP...",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -444,22 +563,27 @@ async def process_archive(client: Client, message: Message):
                 ),
                 parse_mode=enums.ParseMode.MARKDOWN
             )
-            await status.delete()
+            # Final update (keep bar visible)
+            await status.edit_text(
+                f"✅ **All done!**\n\n"
+                f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
+                f"📄 **{counter-1}** files sent above ⬆️\n"
+                f"📂 Scanned **{total_cookie_files:,}** cookie files",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
         else:
             await status.edit_text(
-                f"❌ **No valid cookies** found for `{domain}`\n"
-                f"📂 Scanned **{total_files:,}** files"
+                f"❌ **No cookies** found for `{domain}`\n"
+                f"📂 Scanned **{total_cookie_files:,}** cookie files"
             )
 
     except Exception as e:
         print(f"❌ ERROR: {e}")
         await status.edit_text(f"❌ **Error**: {e}")
-        if os.path.exists(archive_path): os.remove(archive_path)
 
     finally:
         if os.path.exists(output_zip_path):
             os.remove(output_zip_path)
-            print("🧹 Output ZIP deleted")
 
 # ── Fake web server for Render ────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
@@ -474,5 +598,4 @@ def run_server():
 if __name__ == "__main__":
     print("🚀 Cookie Bot Starting...")
     threading.Thread(target=run_server, daemon=True).start()
-    print("✅ Web server on port 10000")
     app.run()
