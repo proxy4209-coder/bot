@@ -178,6 +178,37 @@ def domain_matches(cookie_domain: str, search_domain: str) -> bool:
     
     return False
 
+# ── Content validation ────────────────────────────────────────────────────────
+def is_valid_cookie_content(content: bytes) -> bool:
+    """
+    Check if content has any readable cookie-like data
+    """
+    try:
+        # Try to decode as text
+        text = content.decode('utf-8', errors='ignore')
+        
+        # Check for domain patterns
+        if re.search(r'[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text):
+            # Check for tab-separated format
+            lines = text.splitlines()
+            for line in lines[:20]:  # Check first 20 lines
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '\t' in line and len(line.split('\t')) >= 3:
+                    return True
+                # Check for JSON structure
+                if line.startswith(('{', '[')) and any(kw in line.lower() for kw in ['domain', 'name', 'value']):
+                    return True
+        
+        # Check for SQLite header
+        if content.startswith(b'SQLite format'):
+            return True
+            
+        return False
+    except:
+        return False
+
 # ── Netscape cookie parser ────────────────────────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     """
@@ -429,6 +460,10 @@ def parse_cookies(content: bytes, filename: str, domain_filter: str) -> list:
     domain_filter = domain_filter.strip().lower().lstrip(".")
     filename_lower = filename.lower()
     
+    # Quick validation - skip obviously invalid content
+    if not is_valid_cookie_content(content):
+        return []
+    
     # Check file extension to determine parsing method
     if filename_lower.endswith(('.sqlite', '.db')):
         results = parse_sqlite_cookies(content, domain_filter)
@@ -470,7 +505,7 @@ def parse_cookies(content: bytes, filename: str, domain_filter: str) -> list:
         print(f"✅ Extracted cookies from binary file: {filename} ({len(results)} cookies)")
         return results
     
-    print(f"⚠️ No cookies found in: {filename}")
+    print(f"⏭️ No cookies found in: {filename}")
     return []
 
 # ── PHASE 1: Count all files inside archive ───────────────────────────────────
@@ -854,14 +889,16 @@ async def process_archive(client: Client, message: Message):
     total_cookie_files = len(cookie_files)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE 3 — SCAN COOKIES (MULTI-FORMAT)
+    # PHASE 3 — SCAN COOKIES (MULTI-FORMAT) - FIXED: Only create files with cookies
     # ════════════════════════════════════════════════════════════════════════
     output_zip_path = f"/tmp/{uid}_{domain}_results.zip"
     total_matches = 0
-    counter = 1
+    output_file_counter = 1  # Renamed from 'counter' to avoid confusion
     scan_start = time.time()
     last_scan_update = [0]
     parsed_formats = {"netscape": 0, "sqlite": 0, "json": 0, "urlencoded": 0, "binary": 0}
+    files_with_cookies = 0  # Track how many files actually contained cookies
+    skipped_files = 0  # Track skipped files
 
     # Show initial scan bar immediately
     await status.edit_text(
@@ -878,14 +915,22 @@ async def process_archive(client: Client, message: Message):
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf_out:
             for i, (orig_path, content_bytes) in enumerate(cookie_files):
                 try:
+                    # Quick validation - skip obviously invalid content
+                    if not is_valid_cookie_content(content_bytes):
+                        skipped_files += 1
+                        print(f"⏭️ Skipping invalid/binary file: {orig_path}")
+                        continue
+                    
                     # Use multi-format parser
                     matches = parse_cookies(content_bytes, orig_path, domain)
                     
-                    if matches:
-                        out_name = f"{domain_prefix}_{counter}.txt"
+                    # ONLY create output file if matches were found
+                    if matches and len(matches) > 0:
+                        out_name = f"{domain_prefix}_{output_file_counter}.txt"
                         zf_out.writestr(out_name, "\n".join(matches))
                         total_matches += len(matches)
-                        counter += 1
+                        files_with_cookies += 1
+                        output_file_counter += 1
                         
                         # Track format type
                         if orig_path.endswith(('.sqlite', '.db')):
@@ -894,9 +939,14 @@ async def process_archive(client: Client, message: Message):
                             parsed_formats["json"] += 1
                         else:
                             parsed_formats["netscape"] += 1
+                        
+                        print(f"✅ Created {out_name} with {len(matches)} cookies from {orig_path}")
+                    else:
+                        print(f"⏭️ Skipped {orig_path} - no cookies found")
                             
                 except Exception as e:
-                    print(f"⚠️ {orig_path}: {e}")
+                    print(f"⚠️ Error processing {orig_path}: {e}")
+                    skipped_files += 1
 
                 # Update scan bar every 2s
                 now = time.time()
@@ -917,52 +967,62 @@ async def process_archive(client: Client, message: Message):
                             f"📂 Files: **{i+1:,}** / **{total_cookie_files:,}**\n"
                             f"🚀 Speed: **{speed:.0f} files/s**\n"
                             f"⏳ ETA: **{eta_s}**\n"
-                            f"🍪 Cookies found: **{total_matches:,}** in **{counter-1}** files\n"
+                            f"🍪 Cookies found: **{total_matches:,}** in **{files_with_cookies}** files\n"
                             f"{format_info}",
                             parse_mode=enums.ParseMode.MARKDOWN
                         )
                     except: pass
 
-        # Final result
+        # Final result - ONLY if we have matches
         if total_matches > 0:
             format_summary = f"\n📊 **Parsing Summary:**\n"
             format_summary += f"• Netscape: {parsed_formats['netscape']} files\n"
             format_summary += f"• SQLite: {parsed_formats['sqlite']} files\n"
             format_summary += f"• JSON: {parsed_formats['json']} files"
+            if skipped_files > 0:
+                format_summary += f"\n• Skipped (invalid): {skipped_files} files"
             
             await status.edit_text(
                 f"✅ **Done! Scan complete**\n\n"
                 f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
-                f"📄 **{counter-1}** output files\n"
-                f"📂 **{total_cookie_files:,}** cookie files scanned{format_summary}\n\n"
+                f"📄 **{files_with_cookies}** output files (from {total_cookie_files} scanned)\n"
+                f"{format_summary}\n\n"
                 f"📦 Sending ZIP...",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
             
-            await client.send_document(
-                message.chat.id,
-                document=output_zip_path,
-                caption=(
+            # Only send if we have files in the zip
+            if files_with_cookies > 0:
+                await client.send_document(
+                    message.chat.id,
+                    document=output_zip_path,
+                    caption=(
+                        f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
+                        f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{files_with_cookies}.txt`\n"
+                        f"📊 Scanned {total_cookie_files} files, found cookies in {files_with_cookies}\n"
+                        f"📋 Formats: Netscape:{parsed_formats['netscape']} SQLite:{parsed_formats['sqlite']} JSON:{parsed_formats['json']}"
+                    ),
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+                
+                # Final update
+                await status.edit_text(
+                    f"✅ **All done!**\n\n"
                     f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
-                    f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{counter-1}.txt`\n"
-                    f"📊 Scanned {total_cookie_files} files\n"
-                    f"📋 Formats: Netscape:{parsed_formats['netscape']} SQLite:{parsed_formats['sqlite']} JSON:{parsed_formats['json']}"
-                ),
-                parse_mode=enums.ParseMode.MARKDOWN
-            )
-            
-            # Final update
-            await status.edit_text(
-                f"✅ **All done!**\n\n"
-                f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
-                f"📄 **{counter-1}** files sent above ⬆️\n"
-                f"📂 Scanned **{total_cookie_files:,}** cookie files{format_summary}",
-                parse_mode=enums.ParseMode.MARKDOWN
-            )
+                    f"📄 **{files_with_cookies}** files sent above ⬆️\n"
+                    f"📂 Scanned **{total_cookie_files:,}** cookie files{format_summary}",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+            else:
+                await status.edit_text(
+                    f"❌ **Error**: No valid cookies found to send",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
         else:
             await status.edit_text(
                 f"❌ **No cookies** found for `{domain}`\n"
-                f"📂 Scanned **{total_cookie_files:,}** cookie files",
+                f"📂 Scanned **{total_cookie_files:,}** cookie files\n"
+                f"⚠️ Skipped **{skipped_files}** invalid/binary files",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
 
