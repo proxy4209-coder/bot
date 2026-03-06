@@ -776,50 +776,10 @@ async def process_archive(client: Client, message: Message):
         with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf_out:
             for i, (orig_path, content_bytes) in enumerate(cookie_files):
                 try:
-                    # Try to decode as text
-                    text = content_bytes.decode('utf-8', errors='ignore')
-                    
-                    # Check if this is valid Netscape format (tab-separated with domain)
-                    is_valid_netscape = False
-                    lines = text.splitlines()
-                    for line in lines[:10]:  # Check first 10 lines
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            parts = line.split('\t')
-                            if len(parts) >= 7 and '.' in parts[0]:
-                                is_valid_netscape = True
-                                break
-                    
-                    if not is_valid_netscape:
-                        # This is likely binary/encoded data - skip it
-                        skipped_binary += 1
-                        print(f"⏭️ Skipping binary/unreadable file: {orig_path}")
-                        
-                        # Update progress for skipped files
-                        now = time.time()
-                        if now - last_scan_update[0] >= 2.0:
-                            last_scan_update[0] = now
-                            elapsed = now - scan_start
-                            speed = (i + 1) / elapsed if elapsed > 0 else 0
-                            remaining = total_cookie_files - (i + 1)
-                            eta = int(remaining / speed) if speed > 0 else 0
-                            pct = (i + 1) / total_cookie_files * 100 if total_cookie_files > 0 else 0
-                            bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
-                            eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
-                            try:
-                                await status.edit_text(
-                                    f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
-                                    f"`[{bar}]` **{pct:.1f}%**\n"
-                                    f"📂 Files: **{i+1:,}** / **{total_cookie_files:,}**\n"
-                                    f"🚀 Speed: **{speed:.0f} files/s**\n"
-                                    f"⏳ ETA: **{eta_s}**\n"
-                                    f"🍪 Cookies found: **{total_matches:,}** in **{files_with_cookies}** files\n"
-                                    f"📊 Skipped: binary={skipped_binary} no-match={skipped_no_matches}",
-                                    parse_mode=enums.ParseMode.MARKDOWN
-                                )
-                            except: pass
-                        continue
-                    
+                    # Decode and pass directly to parser — no binary pre-filter
+                    # (same behaviour as main(5).py: let parse_netscape_cookies decide)
+                    text = content_bytes.decode('utf-8', errors='ignore').replace('\x00', '')
+
                     # Parse Netscape cookies
                     matches = parse_netscape_cookies(text, domain)
                     
@@ -866,24 +826,18 @@ async def process_archive(client: Client, message: Message):
                             f"📂 Files: **{i+1:,}** / **{total_cookie_files:,}**\n"
                             f"🚀 Speed: **{speed:.0f} files/s**\n"
                             f"⏳ ETA: **{eta_s}**\n"
-                            f"🍪 Cookies found: **{total_matches:,}** in **{files_with_cookies}** files\n"
-                            f"📊 Skipped: binary={skipped_binary} no-match={skipped_no_matches}",
+                            f"🍪 Cookies found: **{total_matches:,}** in **{files_with_cookies}** files",
                             parse_mode=enums.ParseMode.MARKDOWN
                         )
                     except: pass
 
         # Final result - ONLY files with valid cookies
         if total_matches > 0:
-            summary = f"\n📊 **Summary:**\n"
-            summary += f"• Valid cookie files: {files_with_cookies}\n"
-            summary += f"• Skipped (binary data): {skipped_binary}\n"
-            summary += f"• Skipped (no domain match): {skipped_no_matches}"
-            
             await status.edit_text(
                 f"✅ **Done! Scan complete**\n\n"
                 f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
                 f"📄 **{files_with_cookies}** output files\n"
-                f"📂 Scanned **{total_cookie_files:,}** total files{summary}\n\n"
+                f"📂 Scanned **{total_cookie_files:,}** cookie files\n\n"
                 f"📦 Sending ZIP...",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -895,8 +849,7 @@ async def process_archive(client: Client, message: Message):
                 caption=(
                     f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
                     f"📄 `{domain_prefix}_1.txt` → `{domain_prefix}_{files_with_cookies}.txt`\n"
-                    f"📊 Scanned {total_cookie_files} files\n"
-                    f"✅ Valid: {files_with_cookies} | ❌ Binary: {skipped_binary} | ⚠️ No match: {skipped_no_matches}"
+                    f"📊 Scanned **{total_cookie_files:,}** files"
                 ),
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -905,14 +858,13 @@ async def process_archive(client: Client, message: Message):
                 f"✅ **All done!**\n\n"
                 f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
                 f"📄 **{files_with_cookies}** files sent above ⬆️\n"
-                f"📂 Scanned **{total_cookie_files:,}** files{summary}",
+                f"📂 Scanned **{total_cookie_files:,}** cookie files",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
         else:
             await status.edit_text(
                 f"❌ **No cookies** found for `{domain}`\n"
-                f"📂 Scanned **{total_cookie_files:,}** files\n"
-                f"📊 Binary files skipped: {skipped_binary}",
+                f"📂 Scanned **{total_cookie_files:,}** cookie files",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
 
