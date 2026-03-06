@@ -458,6 +458,11 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                 
                 # Check if it's a cookie file OR a .txt inside a cookies-named folder
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
+                    # Skip files larger than 5MB — real cookie files are always small text
+                    if member.file_size > 5 * 1024 * 1024:
+                        if counter is not None:
+                            counter[0] += 1
+                        continue
                     try:
                         content = zf.read(member, pwd=password)
                         results.append((fname, content))
@@ -515,6 +520,11 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                         pass  # suppress per-file noise
                 
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
+                    # Skip files larger than 5MB — real cookie files are always small text
+                    if member.file_size > 5 * 1024 * 1024:
+                        if counter is not None:
+                            counter[0] += 1
+                        continue
                     try:
                         content = rf.read(member)
                         results.append((fname, content))
@@ -747,7 +757,7 @@ async def process_archive(client: Client, message: Message):
     )
 
     # Show extraction progress while thread runs (timeout: 30 min)
-    MAX_EXTRACT_SECS = 1800
+    MAX_EXTRACT_SECS = 300
     while not extraction_done.is_set():
         await asyncio.sleep(2)
         now = time.time()
@@ -780,6 +790,18 @@ async def process_archive(client: Client, message: Message):
         await asyncio.wait_for(extraction_done.wait(), timeout=10)
     except asyncio.TimeoutError:
         pass  # thread still running but we move on with what we have
+
+    # Update to 100% so it doesn't freeze at 90%
+    try:
+        await status2.edit_text(
+            f"✅ **Phase 2/3 — Extraction complete**\n"
+            f"`[████████████████████]` **100%**\n"
+            f"📄 Files: **{total_files:,}** / **{total_files:,}**\n"
+            f"🍪 Cookie files found: **{len(cookie_files_result):,}**\n\n"
+            f"⏳ Starting scan...",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+    except: pass
 
     # Delete input archive
     if os.path.exists(archive_path):
