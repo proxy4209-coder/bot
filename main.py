@@ -586,8 +586,8 @@ async def process_archive(client: Client, message: Message):
     if is_rar and not RAR_SUPPORTED:
         await message.reply("❌ RAR not supported on this server.")
         return
-    if filesize > 2e9:
-        await message.reply("❌ Max 2GB")
+    if filesize > 4e9:
+        await message.reply("❌ Max 4GB")
         return
 
     ext = '.rar' if is_rar else '.zip'
