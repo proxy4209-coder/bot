@@ -720,6 +720,17 @@ async def process_archive(client: Client, message: Message):
     extract_thread = threading.Thread(target=run_extraction, daemon=True)
     extract_thread.start()
 
+    # Send a NEW message for Phase 2 — Phase 1 message stays untouched
+    status2 = await message.reply(
+        f"📂 **Phase 2/3 — Extracting**\n"
+        f"`[░░░░░░░░░░░░░░░░░░░░]` **0.0%**\n"
+        f"📄 Files: **0** / **{total_files:,}**\n"
+        f"🚀 Speed: **— files/s**\n"
+        f"⏳ ETA: **—**\n"
+        f"🍪 Cookie files found: **0**",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
     # Show extraction progress while thread runs
     while not extraction_done.is_set():
         await asyncio.sleep(2)
@@ -734,7 +745,7 @@ async def process_archive(client: Client, message: Message):
         eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
         spd_s = f"{speed:.0f} files/s"
         try:
-            await status.edit_text(
+            await status2.edit_text(
                 f"📂 **Phase 2/3 — Extracting**\n"
                 f"`[{bar}]` **{pct:.1f}%**\n"
                 f"📄 Files: **{n:,}** / **{total_files:,}**\n"
@@ -768,7 +779,7 @@ async def process_archive(client: Client, message: Message):
     skipped_no_matches = 0
 
     # Show initial scan bar
-    await status.edit_text(
+    await status2.edit_text(
         f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
         f"`[░░░░░░░░░░░░░░░░░░░░]` **0.0%**\n"
         f"📂 Files: **0** / **{total_cookie_files:,}**\n"
@@ -792,8 +803,8 @@ async def process_archive(client: Client, message: Message):
                     # ONLY create output file if matches were found
                     if matches and len(matches) > 0:
                         out_name = f"{domain_prefix}_{output_file_counter}.txt"
-                        # Build Netscape-format content with header
-                        lines_out = ["# Netscape HTTP Cookie File"]
+                        # Write cookie lines only — no header
+                        lines_out = []
                         for line in matches:
                             if "\t" in line:
                                 parts_out = line.split("\t", 6)
@@ -826,7 +837,7 @@ async def process_archive(client: Client, message: Message):
                     bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
                     eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
                     try:
-                        await status.edit_text(
+                        await status2.edit_text(
                             f"🔍 **Phase 3/3 — Scanning** `{domain}`\n"
                             f"`[{bar}]` **{pct:.1f}%**\n"
                             f"📂 Files: **{i+1:,}** / **{total_cookie_files:,}**\n"
@@ -839,7 +850,7 @@ async def process_archive(client: Client, message: Message):
 
         # Final result - ONLY files with valid cookies
         if total_matches > 0:
-            await status.edit_text(
+            await status2.edit_text(
                 f"✅ **Done! Scan complete**\n\n"
                 f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
                 f"📄 **{files_with_cookies}** output files\n"
@@ -860,7 +871,7 @@ async def process_archive(client: Client, message: Message):
                 parse_mode=enums.ParseMode.MARKDOWN
             )
             
-            await status.edit_text(
+            await status2.edit_text(
                 f"✅ **All done!**\n\n"
                 f"🍪 **{total_matches:,} cookies** for `{domain}`\n"
                 f"📄 **{files_with_cookies}** files sent above ⬆️\n"
@@ -868,7 +879,7 @@ async def process_archive(client: Client, message: Message):
                 parse_mode=enums.ParseMode.MARKDOWN
             )
         else:
-            await status.edit_text(
+            await status2.edit_text(
                 f"❌ **No cookies** found for `{domain}`\n"
                 f"📂 Scanned **{total_cookie_files:,}** cookie files",
                 parse_mode=enums.ParseMode.MARKDOWN
@@ -876,7 +887,7 @@ async def process_archive(client: Client, message: Message):
 
     except Exception as e:
         print(f"❌ ERROR: {e}")
-        await status.edit_text(f"❌ **Error**: {e}")
+        await status2.edit_text(f"❌ **Error**: {e}")
 
     finally:
         if os.path.exists(output_zip_path):
