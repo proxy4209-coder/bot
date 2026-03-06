@@ -178,6 +178,44 @@ def domain_matches(cookie_domain: str, search_domain: str) -> bool:
     
     return False
 
+# ── Cookie field sanitizer ────────────────────────────────────────────────────
+def _sanitize_field(s: str) -> str:
+    """Make a cookie field safe for UTF-8 text: no nulls, no control chars, no surrogates."""
+    if not s:
+        return s
+    s = s.replace("\x00", "")
+    out = []
+    for c in s:
+        if c == "\t" or ord(c) >= 32:
+            if ord(c) <= 0x10FFFF and (ord(c) < 0xD800 or ord(c) > 0xDFFF):
+                out.append(c)
+            else:
+                out.append("\uFFFD")
+    s = "".join(out)
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _looks_like_cookie_line(domain: str, expiry: str, name: str) -> bool:
+    """Reject header/junk lines; only accept lines that look like real Netscape cookies."""
+    domain_lower = domain.lower().strip()
+    # Real cookie domain must have a dot and no spaces
+    if "." not in domain_lower or " " in domain:
+        return False
+    # Reject OnlyLogs-style junk headers and spam links
+    if any(x in domain_lower for x in (
+        "t.me", "onlyfans", "reserve", "linktr.ee",
+        "http://", "https://", "buy:", "link:"
+    )):
+        return False
+    # Expiry must be numeric
+    if not expiry.strip().isdigit():
+        return False
+    # Name must be present
+    if not name.strip():
+        return False
+    return True
+
+
 # ── Netscape cookie parser ────────────────────────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     """
@@ -199,18 +237,26 @@ def parse_netscape_cookies(text: str, domain_filter: str):
         
         if len(parts) < 7:
             continue
-            
-        domain, flag, path, secure, expiry, name, value = parts[:7]
-        
-        # Clean domain for matching
-        domain_clean = domain.lower().lstrip(".")
-        
+
+        domain, flag, path, secure, expiry, name, value = (
+            parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]
+        )
+
+        # Reject junk / header lines before domain check
+        if not _looks_like_cookie_line(domain, expiry, name):
+            continue
+
         # Use enhanced domain matching
+        domain_clean = domain.lower().lstrip(".")
         if domain_matches(domain_clean, domain_filter):
-            # Ensure proper tab format
-            result_line = "\t".join([domain, flag, path, secure, expiry, name, value])
+            result_line = "\t".join([
+                _sanitize_field(domain), _sanitize_field(flag),
+                _sanitize_field(path),   _sanitize_field(secure),
+                _sanitize_field(expiry), _sanitize_field(name),
+                _sanitize_field(value),
+            ])
             results.append(result_line)
-    
+
     return results
 
 # ── SQLite cookie parser (kept for future use) ───────────────────────────────
@@ -780,7 +826,15 @@ async def process_archive(client: Client, message: Message):
                     # ONLY create output file if matches were found
                     if matches and len(matches) > 0:
                         out_name = f"{domain_prefix}_{output_file_counter}.txt"
-                        zf_out.writestr(out_name, "\n".join(matches))
+                        # Build Netscape-format content with header
+                        lines_out = ["# Netscape HTTP Cookie File"]
+                        for line in matches:
+                            if "\t" in line:
+                                parts_out = line.split("\t", 6)
+                                if len(parts_out) >= 7:
+                                    line = "\t".join(_sanitize_field(p) for p in parts_out)
+                            lines_out.append(line)
+                        zf_out.writestr(out_name, "\n".join(lines_out) + "\n")
                         total_matches += len(matches)
                         files_with_cookies += 1
                         output_file_counter += 1
