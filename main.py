@@ -216,6 +216,15 @@ def _looks_like_cookie_line(domain: str, expiry: str, name: str) -> bool:
     return True
 
 
+def _is_valid_cookie_domain(domain: str, domain_filter: str) -> bool:
+    """Strict match: only accept exact domain or subdomain of domain_filter."""
+    d = domain.strip().lower().lstrip(".")
+    f = domain_filter.strip().lower().lstrip(".")
+    if not d or not f:
+        return False
+    return d == f or d.endswith("." + f)
+
+
 # ── Netscape cookie parser ────────────────────────────────────────────────────
 def parse_netscape_cookies(text: str, domain_filter: str):
     """
@@ -246,9 +255,10 @@ def parse_netscape_cookies(text: str, domain_filter: str):
         if not _looks_like_cookie_line(domain, expiry, name):
             continue
 
-        # Use enhanced domain matching
-        domain_clean = domain.lower().lstrip(".")
-        if domain_matches(domain_clean, domain_filter):
+        # Use strict domain matching — same as main(5).py
+        # (domain_matches() has substring logic that causes false positives,
+        #  e.g. "x.com" matches "netflix.com" because x.com is inside netflix.com)
+        if _is_valid_cookie_domain(domain, domain_filter):
             result_line = "\t".join([
                 _sanitize_field(domain), _sanitize_field(flag),
                 _sanitize_field(path),   _sanitize_field(secure),
