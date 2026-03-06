@@ -425,7 +425,7 @@ def count_archive_contents(path: str, password: bytes = None) -> dict:
 # ── PHASE 2: Extract with progress callback ───────────────────────────────────
 def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                                    depth: int = 0, max_depth: int = 6,
-                                   progress_cb=None, counter=None):
+                                   progress_cb=None, counter=None, cookie_counter=None):
     results = []
     if depth > max_depth:
         return results
@@ -450,10 +450,10 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                         nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
                         with open(nested_path, 'wb') as f:
                             f.write(data)
-                        nested = collect_from_archive(nested_path, password, depth + 1, max_depth, progress_cb, counter)
+                        nested = collect_from_archive(nested_path, password, depth + 1, max_depth, progress_cb, counter, cookie_counter)
                         results.extend(nested)
                         os.remove(nested_path)
-                    except Exception as e:
+                    except Exception:
                         pass  # suppress per-file noise
                 
                 # Check if it's a cookie file OR a .txt inside a cookies-named folder
@@ -461,7 +461,9 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                     try:
                         content = zf.read(member, pwd=password)
                         results.append((fname, content))
-                    except Exception as e:
+                        if cookie_counter is not None:
+                            cookie_counter[0] += 1
+                    except Exception:
                         pass  # suppress per-file noise
                 
                 # tick progress
@@ -479,7 +481,7 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
 
 def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                                    depth: int = 0, max_depth: int = 6,
-                                   progress_cb=None, counter=None):
+                                   progress_cb=None, counter=None, cookie_counter=None):
     results = []
     if not RAR_SUPPORTED or depth > max_depth:
         return results
@@ -506,17 +508,19 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                         with open(nested_path, 'wb') as f:
                             f.write(data)
                         nested = collect_from_archive(nested_path, password.encode() if password else None,
-                                                      depth + 1, max_depth, progress_cb, counter)
+                                                      depth + 1, max_depth, progress_cb, counter, cookie_counter)
                         results.extend(nested)
                         os.remove(nested_path)
-                    except Exception as e:
+                    except Exception:
                         pass  # suppress per-file noise
                 
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
                     try:
                         content = rf.read(member)
                         results.append((fname, content))
-                    except Exception as e:
+                        if cookie_counter is not None:
+                            cookie_counter[0] += 1
+                    except Exception:
                         pass  # suppress per-file noise
                 
                 if counter is not None:
@@ -530,11 +534,11 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
     return results
 
 def collect_from_archive(path: str, password: bytes = None, depth: int = 0,
-                         max_depth: int = 6, progress_cb=None, counter=None):
+                         max_depth: int = 6, progress_cb=None, counter=None, cookie_counter=None):
     if path.lower().endswith('.rar'):
         pwd_str = password.decode('utf-8', errors='ignore') if password else None
-        return collect_cookie_files_from_rar(path, pwd_str, depth, max_depth, progress_cb, counter)
-    return collect_cookie_files_from_zip(path, password, depth, max_depth, progress_cb, counter)
+        return collect_cookie_files_from_rar(path, pwd_str, depth, max_depth, progress_cb, counter, cookie_counter)
+    return collect_cookie_files_from_zip(path, password, depth, max_depth, progress_cb, counter, cookie_counter)
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command("start"))
@@ -710,20 +714,23 @@ async def process_archive(client: Client, message: Message):
     # PHASE 2 — EXTRACT (collect cookie files with progress)
     # ════════════════════════════════════════════════════════════════════════
     extract_start = time.time()
-    extracted_counter = [0]
+    extracted_counter = [0]   # total files scanned
+    cookie_counter    = [0]   # cookie files found (incremental)
     last_extract_update = [0]
 
     # We run extraction in a thread so we can update progress from main loop
     cookie_files_result = []
     extraction_done = asyncio.Event()
+    loop = asyncio.get_event_loop()
 
     def run_extraction():
-        def progress_cb(n):
-            pass  # we update from async side
-        result = collect_from_archive(archive_path, archive_password,
-                                      counter=extracted_counter)
+        result = collect_from_archive(
+            archive_path, archive_password,
+            counter=extracted_counter,
+            cookie_counter=cookie_counter,
+        )
         cookie_files_result.extend(result)
-        extraction_done.set()
+        loop.call_soon_threadsafe(extraction_done.set)
 
     extract_thread = threading.Thread(target=run_extraction, daemon=True)
     extract_thread.start()
@@ -739,11 +746,15 @@ async def process_archive(client: Client, message: Message):
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
-    # Show extraction progress while thread runs
+    # Show extraction progress while thread runs (timeout: 30 min)
+    MAX_EXTRACT_SECS = 1800
     while not extraction_done.is_set():
         await asyncio.sleep(2)
         now = time.time()
         elapsed = now - extract_start
+        # Hard timeout — don't hang forever on a stuck file
+        if elapsed > MAX_EXTRACT_SECS:
+            break
         n = extracted_counter[0]
         speed = n / elapsed if elapsed > 0 else 0
         remaining = total_files - n if total_files > 0 else 0
@@ -759,13 +770,16 @@ async def process_archive(client: Client, message: Message):
                 f"📄 Files: **{n:,}** / **{total_files:,}**\n"
                 f"🚀 Speed: **{spd_s}**\n"
                 f"⏳ ETA: **{eta_s}**\n"
-                f"🍪 Cookie files found: **{len(cookie_files_result):,}**",
+                f"🍪 Cookie files found: **{cookie_counter[0]:,}**",
                 parse_mode=enums.ParseMode.MARKDOWN
             )
         except: pass
 
-    # Wait for extraction to complete
-    await extraction_done.wait()
+    # Wait for thread (with timeout) — won't hang forever
+    try:
+        await asyncio.wait_for(extraction_done.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        pass  # thread still running but we move on with what we have
 
     # Delete input archive
     if os.path.exists(archive_path):
