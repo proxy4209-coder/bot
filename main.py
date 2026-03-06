@@ -429,6 +429,9 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                     
                 fname = member.filename
                 basename = os.path.basename(fname)
+                # Check if this file lives inside a folder whose name contains "cookie"
+                parent_folder = os.path.basename(os.path.dirname(fname)).lower()
+                in_cookies_folder = "cookie" in parent_folder
                 
                 # Handle nested archives
                 if is_archive(basename):
@@ -443,8 +446,8 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                     except Exception as e:
                         print(f"⚠️ Nested error {basename}: {e}")
                 
-                # Check if it's a cookie file
-                elif is_cookie_file(basename):
+                # Check if it's a cookie file OR a .txt inside a cookies-named folder
+                elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
                     try:
                         content = zf.read(member, pwd=password)
                         results.append((fname, content))
@@ -483,6 +486,9 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                     
                 fname = member.filename
                 basename = os.path.basename(fname)
+                # Check if this file lives inside a folder whose name contains "cookie"
+                parent_folder = os.path.basename(os.path.dirname(fname)).lower()
+                in_cookies_folder = "cookie" in parent_folder
                 
                 if is_archive(basename):
                     try:
@@ -497,7 +503,7 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                     except Exception as e:
                         print(f"⚠️ Nested error {basename}: {e}")
                 
-                elif is_cookie_file(basename):
+                elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
                     try:
                         content = rf.read(member)
                         results.append((fname, content))
