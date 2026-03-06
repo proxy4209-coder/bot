@@ -454,16 +454,15 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                         results.extend(nested)
                         os.remove(nested_path)
                     except Exception as e:
-                        print(f"⚠️ Nested error {basename}: {e}")
+                        pass  # suppress per-file noise
                 
                 # Check if it's a cookie file OR a .txt inside a cookies-named folder
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
                     try:
                         content = zf.read(member, pwd=password)
                         results.append((fname, content))
-                        print(f"📄 Found cookie file: {fname}")
                     except Exception as e:
-                        print(f"⚠️ Read error {fname}: {e}")
+                        pass  # suppress per-file noise
                 
                 # tick progress
                 if counter is not None:
@@ -511,15 +510,14 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                         results.extend(nested)
                         os.remove(nested_path)
                     except Exception as e:
-                        print(f"⚠️ Nested error {basename}: {e}")
+                        pass  # suppress per-file noise
                 
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
                     try:
                         content = rf.read(member)
                         results.append((fname, content))
-                        print(f"📄 Found cookie file: {fname}")
                     except Exception as e:
-                        print(f"⚠️ Read error {fname}: {e}")
+                        pass  # suppress per-file noise
                 
                 if counter is not None:
                     counter[0] += 1
@@ -825,14 +823,10 @@ async def process_archive(client: Client, message: Message):
                         total_matches += len(matches)
                         files_with_cookies += 1
                         output_file_counter += 1
-                        
-                        print(f"✅ Created {out_name} with {len(matches)} cookies from {orig_path}")
                     else:
                         skipped_no_matches += 1
-                        print(f"⏭️ No cookies for domain in: {orig_path}")
                         
                 except Exception as e:
-                    print(f"⚠️ Error processing {orig_path}: {e}")
                     skipped_binary += 1
 
                 # Update scan bar
