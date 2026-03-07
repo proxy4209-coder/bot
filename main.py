@@ -786,7 +786,7 @@ async def process_archive(client: Client, message: Message):
     )
 
     # Show extraction progress while thread runs
-    MAX_EXTRACT_SECS = 120  # 2 min hard cap
+    MAX_EXTRACT_SECS = 600  # 10 min hard cap (for large archives with 100k+ files)
     STALL_SECS = 30         # show Continue button if no progress for 30s
     last_n = [0]
     last_progress_time = [time.time()]
@@ -862,11 +862,34 @@ async def process_archive(client: Client, message: Message):
     pending_continue.pop(uid, None)
     _read_timeout[0] = 15  # reset for next archive
 
-    # Wait for thread (with timeout) — won't hang forever
-    try:
-        await asyncio.wait_for(extraction_done.wait(), timeout=10)
-    except asyncio.TimeoutError:
-        pass  # thread still running but we move on with what we have
+    # ── Wait for the extraction thread to fully finish ────────────────────────
+    # The while loop may have broken early (stall/timeout) but the thread is
+    # still running and populating cookie_files_result. We MUST wait for it
+    # to complete before moving to Phase 3, otherwise cookie_files_result is empty.
+    if not extraction_done.is_set():
+        try:
+            await status2.edit_text(
+                f"📂 **Phase 2/3 — Finishing extraction...**\n"
+                f"🍪 Cookie files so far: **{cookie_counter[0]:,}**\n"
+                f"⏳ Please wait...",
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+        except: pass
+
+        # Wait up to 10 minutes for thread to finish — update message every 5s
+        wait_start = time.time()
+        while not extraction_done.is_set():
+            await asyncio.sleep(5)
+            if time.time() - wait_start > 600:  # 10 min absolute max
+                break
+            try:
+                await status2.edit_text(
+                    f"📂 **Phase 2/3 — Finishing extraction...**\n"
+                    f"🍪 Cookie files found: **{cookie_counter[0]:,}**\n"
+                    f"⏳ Still extracting... ({int(time.time()-wait_start)}s)",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+            except: pass
 
     # Update to 100% so it doesn't freeze at 90%
     try:
