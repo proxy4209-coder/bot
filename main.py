@@ -8,9 +8,10 @@ import tempfile
 import asyncio
 import zipfile
 import threading
+import concurrent.futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 try:
     import rarfile
@@ -26,6 +27,7 @@ app = Client("cookiebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 pending_domains = {}
 pending_passwords = {}
+pending_continue = {}   # uid -> asyncio.Event — set when user clicks Continue
 
 # ── Cookie filename matching ──────────────────────────────────────────────────
 COOKIE_FILENAMES_EXACT = {
@@ -423,6 +425,13 @@ def count_archive_contents(path: str, password: bytes = None) -> dict:
     }
 
 # ── PHASE 2: Extract with progress callback ───────────────────────────────────
+# Shared: button sets this to a small value to force-skip the stuck file
+_read_timeout = [15]   # seconds per file read; button sets to 2 to force-skip
+
+def _read_zip_member(zf, member, password):
+    """Run in a sub-thread so we can apply a timeout to it."""
+    return zf.read(member, pwd=password)
+
 def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                                    depth: int = 0, max_depth: int = 6,
                                    progress_cb=None, counter=None, cookie_counter=None):
@@ -430,6 +439,7 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
     if depth > max_depth:
         return results
     
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             members = zf.infolist()
@@ -439,14 +449,14 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                     
                 fname = member.filename
                 basename = os.path.basename(fname)
-                # Check if this file lives inside a folder whose name contains "cookie"
                 parent_folder = os.path.basename(os.path.dirname(fname)).lower()
                 in_cookies_folder = "cookie" in parent_folder
                 
                 # Handle nested archives
                 if is_archive(basename):
                     try:
-                        data = zf.read(member, pwd=password)
+                        future = executor.submit(_read_zip_member, zf, member, password)
+                        data = future.result(timeout=_read_timeout[0])
                         nested_path = f"/tmp/nested_{depth}_{int(time.time())}_{basename}"
                         with open(nested_path, 'wb') as f:
                             f.write(data)
@@ -454,22 +464,23 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
                         results.extend(nested)
                         os.remove(nested_path)
                     except Exception:
-                        pass  # suppress per-file noise
+                        pass
                 
                 # Check if it's a cookie file OR a .txt inside a cookies-named folder
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
-                    # Skip files larger than 5MB — real cookie files are always small text
-                    if member.file_size > 5 * 1024 * 1024:
-                        if counter is not None:
-                            counter[0] += 1
-                        continue
-                    try:
-                        content = zf.read(member, pwd=password)
-                        results.append((fname, content))
-                        if cookie_counter is not None:
-                            cookie_counter[0] += 1
-                    except Exception:
-                        pass  # suppress per-file noise
+                    if member.compress_size > 2 * 1024 * 1024 or (member.file_size > 0 and member.file_size > 5 * 1024 * 1024):
+                        pass  # too large — not a real cookie file
+                    else:
+                        try:
+                            future = executor.submit(_read_zip_member, zf, member, password)
+                            content = future.result(timeout=_read_timeout[0])
+                            results.append((fname, content))
+                            if cookie_counter is not None:
+                                cookie_counter[0] += 1
+                        except concurrent.futures.TimeoutError:
+                            pass  # skip stuck file, continue extraction
+                        except Exception:
+                            pass
                 
                 # tick progress
                 if counter is not None:
@@ -481,6 +492,8 @@ def collect_cookie_files_from_zip(zip_path: str, password: bytes = None,
         pass
     except Exception as e:
         print(f"⚠️ ZIP error: {e}")
+    finally:
+        executor.shutdown(wait=False)
     
     return results
 
@@ -520,18 +533,17 @@ def collect_cookie_files_from_rar(rar_path: str, password: str = None,
                         pass  # suppress per-file noise
                 
                 elif is_cookie_file(basename) or (in_cookies_folder and basename.lower().endswith(".txt")):
-                    # Skip files larger than 5MB — real cookie files are always small text
+                    # Skip large files — file_size for RAR is always reliable
                     if member.file_size > 5 * 1024 * 1024:
-                        if counter is not None:
-                            counter[0] += 1
-                        continue
-                    try:
-                        content = rf.read(member)
-                        results.append((fname, content))
-                        if cookie_counter is not None:
-                            cookie_counter[0] += 1
-                    except Exception:
-                        pass  # suppress per-file noise
+                        pass  # skip — not a real cookie file
+                    else:
+                        try:
+                            content = rf.read(member)
+                            results.append((fname, content))
+                            if cookie_counter is not None:
+                                cookie_counter[0] += 1
+                        except Exception:
+                            pass  # suppress per-file noise
                 
                 if counter is not None:
                     counter[0] += 1
@@ -565,6 +577,23 @@ async def text_handler(client: Client, message: Message):
         future = pending_domains.pop(uid)
         if not future.done():
             future.get_loop().call_soon_threadsafe(future.set_result, message.text.strip().lower())
+
+@app.on_callback_query(filters.regex(r"^continue_(\d+)$"))
+async def continue_handler(client: Client, query: CallbackQuery):
+    uid = int(query.matches[0].group(1))
+    if query.from_user.id != uid:
+        await query.answer("❌ This button is not for you.", show_alert=True)
+        return
+    # Shrink per-file read timeout → forces the stuck read to be skipped
+    # and extraction continues from the next file
+    _read_timeout[0] = 2
+    event = pending_continue.get(uid)
+    if event:
+        event.set()
+    await query.answer("▶️ Skipping stuck file, continuing extraction...")
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except: pass
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
@@ -756,16 +785,41 @@ async def process_archive(client: Client, message: Message):
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
-    # Show extraction progress while thread runs (timeout: 30 min)
-    MAX_EXTRACT_SECS = 300
+    # Show extraction progress while thread runs
+    MAX_EXTRACT_SECS = 120  # 2 min hard cap
+    STALL_SECS = 30         # show Continue button if no progress for 30s
+    last_n = [0]
+    last_progress_time = [time.time()]
+    continue_event = asyncio.Event()
+    pending_continue[uid] = continue_event
+    button_shown = [False]
+
     while not extraction_done.is_set():
         await asyncio.sleep(2)
         now = time.time()
         elapsed = now - extract_start
-        # Hard timeout — don't hang forever on a stuck file
+        n = extracted_counter[0]
+
+        # Stall detection
+        if n != last_n[0]:
+            last_n[0] = n
+            last_progress_time[0] = now
+            # If progress resumed and button was shown, hide it
+            if button_shown[0]:
+                button_shown[0] = False
+        
+        stalled = (now - last_progress_time[0] > STALL_SECS)
+
+        # Hard timeout — only break if truly no progress for ages
         if elapsed > MAX_EXTRACT_SECS:
             break
-        n = extracted_counter[0]
+
+        # If continue was clicked, reset stall timer so button hides
+        if continue_event.is_set():
+            last_progress_time[0] = now
+            button_shown[0] = False
+            stalled = False
+
         speed = n / elapsed if elapsed > 0 else 0
         remaining = total_files - n if total_files > 0 else 0
         eta = int(remaining / speed) if speed > 0 else 0
@@ -773,17 +827,40 @@ async def process_archive(client: Client, message: Message):
         bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
         eta_s = f"{eta//60}m {eta%60}s" if eta >= 60 else f"{eta}s"
         spd_s = f"{speed:.0f} files/s"
-        try:
-            await status2.edit_text(
-                f"📂 **Phase 2/3 — Extracting**\n"
-                f"`[{bar}]` **{pct:.1f}%**\n"
-                f"📄 Files: **{n:,}** / **{total_files:,}**\n"
-                f"🚀 Speed: **{spd_s}**\n"
-                f"⏳ ETA: **{eta_s}**\n"
-                f"🍪 Cookie files found: **{cookie_counter[0]:,}**",
-                parse_mode=enums.ParseMode.MARKDOWN
-            )
-        except: pass
+
+        if stalled and not button_shown[0]:
+            # Show Continue button — extraction appears stuck
+            button_shown[0] = True
+            try:
+                await status2.edit_text(
+                    f"📂 **Phase 2/3 — Extracting**\n"
+                    f"`[{bar}]` **{pct:.1f}%**\n"
+                    f"📄 Files: **{n:,}** / **{total_files:,}**\n"
+                    f"🚀 Speed: **{spd_s}**\n"
+                    f"⚠️ Stuck on a large file...\n"
+                    f"🍪 Cookie files found: **{cookie_counter[0]:,}**\n\n"
+                    f"Press **▶️ Continue** to skip and proceed to scan:",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("▶️ Continue to Scan", callback_data=f"continue_{uid}")
+                    ]]),
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+            except: pass
+        elif not stalled:
+            try:
+                await status2.edit_text(
+                    f"📂 **Phase 2/3 — Extracting**\n"
+                    f"`[{bar}]` **{pct:.1f}%**\n"
+                    f"📄 Files: **{n:,}** / **{total_files:,}**\n"
+                    f"🚀 Speed: **{spd_s}**\n"
+                    f"⏳ ETA: **{eta_s}**\n"
+                    f"🍪 Cookie files found: **{cookie_counter[0]:,}**",
+                    parse_mode=enums.ParseMode.MARKDOWN
+                )
+            except: pass
+
+    pending_continue.pop(uid, None)
+    _read_timeout[0] = 15  # reset for next archive
 
     # Wait for thread (with timeout) — won't hang forever
     try:
