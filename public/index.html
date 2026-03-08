@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telegram Bot - Hosting Info</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      max-width: 600px;
+      background: #16213e;
+      border-radius: 16px;
+      padding: 40px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    }
+    h1 { color: #e94560; margin-bottom: 16px; font-size: 24px; }
+    .warning {
+      background: #e945601a;
+      border-left: 4px solid #e94560;
+      padding: 16px;
+      border-radius: 8px;
+      margin-bottom: 24px;
+    }
+    .warning p { line-height: 1.6; }
+    h2 { color: #0f3460; font-size: 18px; margin-bottom: 12px; color: #53a8b6; }
+    ul { list-style: none; padding: 0; }
+    ul li {
+      padding: 10px 0;
+      border-bottom: 1px solid #1a1a2e;
+      line-height: 1.5;
+    }
+    ul li:last-child { border-bottom: none; }
+    a { color: #53a8b6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .step {
+      background: #0f3460;
+      padding: 16px;
+      border-radius: 8px;
+      margin-top: 20px;
+      line-height: 1.8;
+    }
+    code {
+      background: #1a1a2e;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>This Telegram Bot Cannot Run on Netlify</h1>
+    <div class="warning">
+      <p>Netlify is built for static websites and short-lived serverless functions. A Telegram bot using Pyrogram requires a <strong>long-running process</strong> that stays connected to Telegram, which Netlify does not support.</p>
+    </div>
+
+    <h2>Recommended Hosting Platforms</h2>
+    <ul>
+      <li><strong><a href="https://render.com" target="_blank">Render</a></strong> - Deploy with the existing Dockerfile. Free tier available.</li>
+      <li><strong><a href="https://railway.app" target="_blank">Railway</a></strong> - Docker-based deployment, easy setup.</li>
+      <li><strong><a href="https://fly.io" target="_blank">Fly.io</a></strong> - Container hosting with generous free tier.</li>
+    </ul>
+
+    <div class="step">
+      <h2>Quick Start with Render</h2>
+      1. Push this repo to GitHub<br>
+      2. Go to <a href="https://render.com" target="_blank">render.com</a> and create a <strong>Web Service</strong><br>
+      3. Connect your GitHub repo<br>
+      4. Set environment to <strong>Docker</strong><br>
+      5. Add environment variables:<br>
+      <code>BOT_TOKEN</code>, <code>API_ID</code>, <code>API_HASH</code><br>
+      6. Deploy!
+    </div>
+  </div>
+</body>
+</html>

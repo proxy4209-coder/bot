@@ -19,9 +19,9 @@ try:
 except ImportError:
     RAR_SUPPORTED = False
 
-BOT_TOKEN = "8663784484:AAEDaOYGkT8cCnkBvVaCNEp4fjQL3pgDPlQ"
-API_ID = 32201838
-API_HASH = "5e270d2e3ed53eb5d37c8f8016ff4bcd"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
 
 app = Client("cookiebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
